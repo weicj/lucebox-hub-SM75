@@ -65,9 +65,9 @@ Sweet spot at 220W: 95% of the speed, 30% less power. The curve is nonlinear, ti
 | tok/s | 267 | 229 | **411** |
 | Power | 350W | ~130W | 220W |
 | tok/J | 0.76 | 1.76 | **1.87** |
-| GPU price | ~$400 | $2,499+ (system) | ~$400 |
+| GPU price | ~$700 | $2,499+ (system) | ~$700 |
 
-A $400 GPU from 2020, power-limited to 220W, matches Apple's latest chip on efficiency while delivering 1.8x the throughput.
+A $700 GPU from 2020, power-limited to 220W, matches Apple's latest chip on efficiency while delivering 1.8x the throughput.
 
 ## How it works
 
