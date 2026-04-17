@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/svg/banner-dark.svg" alt="Lucebox" width="100%">
+  <img src="assets/banner.jpg" alt="Lucebox" width="100%">
 </p>
 
 <p align="center">
@@ -15,20 +15,12 @@
 </p>
 
 <p align="center">
-  <strong>Open optimization for local AI.</strong><br/>
-  Kernels and quantization for hybrid DeltaNet/Attention LLMs, built for consumer GPUs.<br/>
+  <strong>Open LLM inference, rewritten by hand for one specific chip at a time.</strong><br/>
+  Kernels, speculative decoding, and quantization, tailored per target.<br/>
   We don't wait for better silicon. We rewrite the software.
 </p>
 
 ---
-
-```
-                               megakernel         dflash 27B       target
-  decode   tok/s  @RTX 3090         413                soon         350+
-  prefill  tok/s  @RTX 3090      37,800                soon         —
-  tok/J    @220W                   1.87                soon          1.6+
-  baseline tok/J  llama.cpp        0.76                0.58          —
-```
 
 > The efficiency gap between consumer and datacenter silicon isn't inherent.
 > It's an artifact of running generic software on capable hardware.
@@ -179,5 +171,5 @@ Per-project citations live in each subproject's README.
 ---
 
 <p align="center">
-  <sub><a href="LICENSE">MIT</a> · <a href="https://lucebox.com/terms">Terms</a> · <a href="https://lucebox.com">Lucebox.com</a></sub>
+  <sub><a href="LICENSE">MIT</a> · <a href="https://lucebox.com">Lucebox.com</a></sub>
 </p>
