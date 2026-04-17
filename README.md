@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="Lucebox" width="100%">
+  <img src="assets/banner.png" alt="Lucebox" width="85%">
 </p>
 
 <p align="center">
-  <a href="https://lucebox.com"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=090909&labelColor=090909" alt="lucebox.com"></a>
-  <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=090909&labelColor=090909" alt="Discord"></a>
-  <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=090909&labelColor=090909" alt="Blog"></a>
+  <a href="https://lucebox.com"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=f5c842&labelColor=090909" alt="lucebox.com"></a>
+  <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
+  <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
 </p>
 
 <p align="center">
@@ -60,7 +60,7 @@ python final_bench.py
 |--------|:-------------:|:------------:|:-----:|
 | **Megakernel** `@220W` | **37,800** | **413** | **1.87** |
 | llama.cpp BF16 `@350W` | 11,247 | 267 | 0.76 |
-| PyTorch HF | 7,578 | 108 | — |
+| PyTorch HF | 7,578 | 108 | n/a |
 
 **What makes it work:** 82 blocks, 512 threads, one persistent kernel. No CPU round-trips between layers. Weights streamed straight from HuggingFace. Cooperative grid sync instead of ~100 kernel launches per token. Power ceiling hit before compute ceiling, so DVFS converts tight execution straight into saved watts.
 
@@ -68,20 +68,30 @@ python final_bench.py
 
 ---
 
-## 02 · DFlash 27B &nbsp;<sub><sup>`· coming soon`</sup></sub>
+## 02 · DFlash 27B
 
-**Hybrid DeltaNet quantization for Qwen 3.5-27B, on one RTX 3090.** A 27B hybrid model shouldn't fit in 24 GB of VRAM. With DeltaNet-aware mixed precision and a fused decode path borrowed from the megakernel, it does, without the recurrence collapse that kills naive int4 on linear attention.
+**First open-source port of DFlash speculative decoding to consumer GPUs.** Qwen3.5-27B at 130 tok/s on a single RTX 3090 (Q4_K_M target + BF16 draft). 128K context in 24 GB. 3.5× faster than chain speculative decoding, 2.9× faster than SGLang AWQ on the same hardware.
 
 ```
-    baseline 27B BF16              → 54 GB        (two GPUs, or CPU offload)
-    naive w4a16 GPTQ               → 13.5 GB      (works for attention, breaks DeltaNet)
-    dflash w4a16 + DeltaNet-aware  → 14.8 GB      (attention int4, DeltaNet int8 state)
-                                                   fits in 24 GB with room for KV cache
+                     AR (tok/s)   DFlash (tok/s)   Speedup
+  HumanEval              37.4         130.7         3.49×
+  Math500                37.4         111.2         2.97×
+  GSM8K                  37.6          97.0         2.58×
 ```
 
-Target: a 27B model that runs locally on a single consumer card, with recurrence quality intact. Benchmarks and open weights land in Q2 2026.
+**The constraint that shaped the project.** AWQ INT4 of Qwen3.5-27B plus the BF16 draft doesn't leave room for the DDTree verify state on a 24 GB card. Q4_K_M GGUF (14.9 GB target) is the largest format that fits target + 3.46 GB draft + budget=22 tree state + KV cache in 24 GB on the RTX 3090. Picking it forced a new port on top of ggml, since no public DFlash runtime supports a GGUF target.
 
-[Design notes →](dflash/README.md)
+**What we built vs what we didn't.** The algorithms are not ours:
+- [**DFlash**](https://arxiv.org/abs/2502.20762) (z-lab, 2025): block-diffusion draft conditioned on target hidden states.
+- [**DDTree**](https://arxiv.org/abs/2502.20762) (Ringel et al., 2025): tree-structured verify that beats chain verify at the same compute budget.
+
+What we ported and tuned:
+- C++/CUDA decode engine on top of ggml (no libllama, no Python runtime, Q4_K_M target path).
+- Three custom CUDA kernels for tree-aware SSM state rollback: `ggml_ssm_conv_tree`, `ggml_gated_delta_net_tree`, `ggml_gated_delta_net_tree_persist`.
+- DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
+- Q4_0 KV cache + sliding `target_feat` ring to fit 128K context in 24 GB with ~3% AL hit.
+
+[Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash)
 
 ---
 
@@ -89,9 +99,9 @@ Target: a 27B model that runs locally on a single consumer card, with recurrence
 
 Conventional wisdom says NVIDIA is fast but power-hungry; Apple is efficient but slower. On paper, that checks out, 267 tok/s at 350 W on llama.cpp vs 229 tok/s at 130 W on an M5 Max.
 
-We've thought the problem was never the hardware. It was ~100 kernel launches per token. It was quantization schemes designed for dense attention, applied blindly to linear recurrence. It was generic software on capable silicon.
+We've thought the problem was never the hardware. It was ~100 kernel launches per token. It was speculative decoding research stuck on H100 BF16 demos while consumer GPU users ran chain EAGLE. It was generic software on capable silicon.
 
-Lucebox is where we publish the fixes. Each project is a standalone artifact, a kernel, a quantization scheme, a benchmark harness, with full writeup and MIT source. Together they build toward a single command surface, `lucebox`, that makes hybrid-architecture local inference a one-line install.
+Lucebox is where we publish the fixes. Each project is a standalone artifact, a kernel, a spec-decode port, a benchmark harness, with full writeup and MIT source. Together they build toward a single command surface, `lucebox`, that makes local inference on consumer chips a one-line install.
 
 ---
 
@@ -117,12 +127,9 @@ cd megakernel && pip install -e . && python final_bench.py
 
 ```
 lucebox-hub/
-├── megakernel/             · fused forward pass for Qwen 3.5-0.8B
-├── dflash/                 · DeltaNet-aware quantization for 27B   [wip]
-├── benchmarks/             · shared measurement harness            [wip]
-├── shared/                 · cross-project utilities               [wip]
-├── docs/                   · longform writeups and design notes
-└── assets/                 · banners, cards, diagrams
+├── megakernel/    · fused forward pass for Qwen 3.5-0.8B
+├── dflash/        · DFlash speculative decoding port for Qwen 3.5-27B on RTX 3090
+└── assets/        · banners, cards, diagrams
 ```
 
 ---
@@ -154,19 +161,19 @@ Per-project citations live in each subproject's README.
 
 ## Inspired by
 
-- [Hazy Research](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles) — for the megakernel idea and the intelligence-per-watt methodology.
-- [DDTree (Ringel et al., 2025)](https://arxiv.org/abs/2502.20762) — tree-structured verify for speculative decoding; what DFlash 27B leans on for its 3.5× speedup.
-- [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen) — prior art on fused Qwen kernels.
-- [z-lab/dflash](https://github.com/z-lab/dflash) — the linear-attention kernel work whose name we borrow for project 02.
+- [Hazy Research](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles): megakernel idea and the intelligence-per-watt methodology.
+- [DDTree (Ringel et al., 2025)](https://arxiv.org/abs/2502.20762): tree-structured verify for speculative decoding, what DFlash 27B leans on for its 3.5× speedup.
+- [AlpinDale/qwen_megakernel](https://github.com/AlpinDale/qwen_megakernel), [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen): prior art on fused Qwen kernels.
+- [z-lab/dflash](https://github.com/z-lab/dflash): the linear-attention kernel work whose name we borrow for project 02.
 
 ---
 
 ## Community
 
-- **Discord** — [discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
-- **Website** — [lucebox.com](https://lucebox.com)
-- **Issues** — [github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
-- **Blog** — [lucebox.com/blog](https://lucebox.com/blog)
+- **Discord**: [discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
+- **Website**: [lucebox.com](https://lucebox.com)
+- **Issues**: [github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
+- **Blog**: [lucebox.com/blog](https://lucebox.com/blog)
 
 ---
 
