@@ -108,7 +108,7 @@ What we ported and tuned:
 - DDTree budget swept for RTX 3090 + Q4_K_M target: **budget=22** is the sweet spot.
 - Q4_0 KV cache + sliding `target_feat` ring to fit 128K context in 24 GB with ~3% AL hit.
 
-[Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash)
+[Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://www.lucebox.com/blog/dflash27b)
 
 ---
 

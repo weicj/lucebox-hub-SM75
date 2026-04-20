@@ -13,7 +13,7 @@
   Qwen3.5-27B at up to 207 tok/s<sup>*</sup> on a single RTX 3090 (HumanEval 10-prompt bench mean 129.5 tok/s at DDTree budget=22). 128K context on 24 GB.<br/>
   3.43× faster than autoregressive (+15% over chain spec decoding), 2.8× faster than SGLang AWQ.<br/>
   <sub><sup>*</sup>Demo run: 207.6 tok/s DFlash vs 38.0 tok/s AR (5.46×).</sub><br/><br/>
-  <a href="https://lucebox.com/blog/dflash">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
+  <a href="https://www.lucebox.com/blog/dflash27b">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
 <p align="center">
