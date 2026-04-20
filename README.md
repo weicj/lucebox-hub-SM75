@@ -39,9 +39,13 @@ Two projects today, more coming. Each one is a self-contained release with its o
 **The first megakernel for hybrid DeltaNet/Attention LLMs.** All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch, 1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2× the throughput.
 
 ```bash
-git clone https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/megakernel
+# 1. clone + enter
+git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/megakernel
+
+# 2. install (Python 3.10+, CUDA 12+, PyTorch 2.0+). Weights stream from HF on first run.
 pip install -e .
+
+# 3. run the benchmark (prefill pp520 + decode tg128 vs llama.cpp BF16 + PyTorch HF)
 python final_bench.py
 ```
 
@@ -62,12 +66,21 @@ python final_bench.py
 **First GGUF port of DFlash speculative decoding.** Qwen3.5-27B at up to 210 tok/s on a single RTX 3090 (demo peak 207.6 tok/s DFlash vs 38.0 tok/s AR, 5.46×; HumanEval 10-prompt bench: 129.5 tok/s mean, 158.4 tok/s peak at DDTree budget=22) (Q4_K_M target + BF16 draft). 128K context in 24 GB (HE bench 134.78 tok/s at ctx=131072). 3.43× faster than autoregressive (+15% over chain spec decoding), 2.8× faster than SGLang AWQ on the same hardware.
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/dflash
+# 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+
+# 2. build the C++/CUDA decoder (~3 min on sm_86, CUDA 12+, CMake 3.18+)
 cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
+
+# 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
 huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
 huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+
+# 4a. one-shot streaming generate
+python3 scripts/run.py --prompt "def fibonacci(n):"
+
+# 4b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
 python3 scripts/bench_llm.py
 ```
 
@@ -103,28 +116,12 @@ AI-assisted development flips that calculus. Rewrites that took a quarter now fi
 
 ---
 
-## Quickstart
+## Requirements
 
-```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub
+NVIDIA GPU (Ampere+, sm_86+), CUDA 12+, PyTorch 2.0+. Tested on RTX 3090 (2020).
+dflash needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops).
 
-# megakernel (Qwen 3.5-0.8B, batch 1)
-cd megakernel && pip install -e . && python final_bench.py && cd ..
-
-# dflash 27B (Qwen 3.5-27B Q4_K_M + z-lab draft, RTX 3090)
-cd dflash
-cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target test_dflash -j
-huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
-huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
-python3 scripts/run.py --prompt "def fibonacci(n):"
-```
-
-**Requirements:** NVIDIA GPU (Ampere+), CUDA 12+, PyTorch 2.0+. Tested on RTX 3090 (2020).
-Use `--recurse-submodules` to pull the pinned `Luce-Org/llama.cpp@luce-dflash` fork that carries the three tree-mode ggml ops.
-
-**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220`
+**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W).
 
 ---
 
