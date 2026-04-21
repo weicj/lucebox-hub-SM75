@@ -19,7 +19,7 @@ from pathlib import Path
 def default_paths():
     return {
         "target": "models/Qwen3.5-27B-Q4_K_M.gguf",
-        "draft":  str(Path.home() / ".cache/huggingface/hub/models--z-lab--Qwen3.5-27B-DFlash/snapshots"),
+        "draft":  "models/draft",
         "bin":    "build/test_dflash" + (".exe" if sys.platform == "win32" else ""),
     }
 
