@@ -59,18 +59,18 @@ AR = autoregressive (`test_generate`). DFlash+DDTree = tree verify at budget=22 
 
 **128K context on 24 GB** via Q4_0 KV cache + sliding `target_feat` ring (4096 slots): ~3% AL hit vs F16 KV, 8× memory saving.
 
-| Prompt length | Prefill time | Decode tok/s |
-|:-------------:|:------------:|:------------:|
-| 520 (HE)      | 0.06 s       | 130          |
-| 13K           | 15 s         | 99           |
-| 32K           | 106 s        | 35           |
-| 128K          | ~10 min      | ~15-20 (est) |
+| Prompt length | KV     | Prefill time | Decode tok/s |
+|:-------------:|:------:|:------------:|:------------:|
+| 520 (HE)      | Q8_0   | 0.06 s       | 130          |
+| 32K           | Q8_0   | 38 s         | 85           |
+| 64K           | Q4_0   | 126 s        | 18           |
+| 128K          | Q4_0   | ~10 min      | ~15-20 (est) |
+
+Prefill numbers assume `--max-ctx` sized to the prompt (auto-fit in `run.py` / `bench_llm.py`). Oversizing — e.g. `--max-ctx=131072` on a 32K prompt — triggers FA stride over unused KV and slows prefill ~27× at that ratio.
 
 HE 10-prompt bench mean in 128K mode (ctx=131072, ddtree-budget=16): **134.78 tok/s** at AL 8.33.
 
 Set `DFLASH27B_KV_Q4=1` to enable. Full sweep in [RESULTS.md](RESULTS.md).
-
-`scripts/run.py` and `scripts/bench_llm.py` auto-fit `--max-ctx` to `align_up(prompt + n_gen + 64, 256)` per call, so no manual sizing is needed. Direct `test_dflash` invocations should pass `--max-ctx=N` matching the prompt — oversized `max_ctx` makes FA stride over unused KV and costs prefill time linearly in the ratio.
 
 ## Quick start
 
