@@ -97,6 +97,23 @@ class ChatRequest(BaseModel):
     stream_options: dict | None = None  # e.g. {"include_usage": true}
 
 
+class AnthropicMessage(BaseModel):
+    role: str
+    # Anthropic allows either a plain string or a list of content blocks.
+    content: str | list[dict]
+
+
+class AnthropicMessagesRequest(BaseModel):
+    model: str = MODEL_NAME
+    max_tokens: int
+    messages: list[AnthropicMessage]
+    system: str | list[dict] | None = None
+    stream: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    stop_sequences: list[str] | None = None
+
+
 # ─── tool-call parser ──────────────────────────────────────────────
 
 # Qwen3.6 chat template emits:
@@ -624,6 +641,150 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 
+    # ── Anthropic Messages API ──────────────────────────────────────
+    # Mirrors the OpenAI endpoint but formatted for the Anthropic SDK
+    # (Claude Code, Anthropic clients). Tool calling NOT forwarded here
+    # yet — agent CLIs that want tools should use /v1/chat/completions.
+
+    def _anthropic_text_from_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+        return "".join(parts)
+
+    def _tokenize_anthropic(req: AnthropicMessagesRequest) -> tuple[Path, int]:
+        msgs = []
+        system_text = _anthropic_text_from_content(req.system) if req.system else None
+        if system_text:
+            msgs.append({"role": "system", "content": system_text})
+        for m in req.messages:
+            msgs.append({"role": m.role,
+                         "content": _anthropic_text_from_content(m.content)})
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        # mkstemp returns (fd, path); discarding fd leaks 1 per request (#15).
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        tmp = Path(path)
+        with os.fdopen(fd, "wb") as f:
+            for t in ids:
+                f.write(struct.pack("<i", int(t)))
+        return tmp, len(ids)
+
+    async def _astream_tokens(r, n_gen):
+        """Yields one token at a time without blocking the event loop.
+        Each 4-byte pipe read is dispatched to a worker thread."""
+        generated = 0
+        hit_stop = False
+        while True:
+            b = await asyncio.to_thread(os.read, r, 4)
+            if not b or len(b) < 4:
+                break
+            tok_id = struct.unpack("<i", b)[0]
+            if tok_id == -1:
+                break
+            if hit_stop:
+                continue
+            if tok_id in stop_ids:
+                hit_stop = True
+                continue
+            generated += 1
+            yield tok_id
+            if generated >= n_gen:
+                hit_stop = True
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(req: AnthropicMessagesRequest):
+        prompt_bin, prompt_len = _tokenize_anthropic(req)
+
+        available_gen = max_ctx - prompt_len - 20
+        gen_len = min(req.max_tokens, available_gen)
+        if gen_len <= 0:
+            try: prompt_bin.unlink()
+            except Exception: pass
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "invalid_request_error",
+                           "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
+                status_code=400)
+
+        msg_id = "msg_" + uuid.uuid4().hex[:24]
+
+        if req.stream:
+            async def sse() -> AsyncIterator[str]:
+                async with daemon_lock:
+                    message_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": msg_id, "type": "message", "role": "assistant",
+                            "model": req.model or MODEL_NAME,
+                            "content": [], "stop_reason": None, "stop_sequence": None,
+                            "usage": {"input_tokens": prompt_len, "output_tokens": 0},
+                        },
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+                    cb_start = {
+                        "type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+
+                    cmd_line = f"{prompt_bin} {gen_len}\n"
+                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                    daemon_proc.stdin.flush()
+
+                    out_tokens = 0
+                    try:
+                        async for tok_id in _astream_tokens(r_pipe, gen_len):
+                            out_tokens += 1
+                            delta = {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "text_delta",
+                                          "text": tokenizer.decode([tok_id])},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                    finally:
+                        try: prompt_bin.unlink()
+                        except Exception: pass
+
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                    msg_delta = {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": out_tokens},
+                    }
+                    yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+            return StreamingResponse(sse(), media_type="text/event-stream")
+
+        # Non-streaming
+        async with daemon_lock:
+            cmd_line = f"{prompt_bin} {gen_len}\n"
+            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+            daemon_proc.stdin.flush()
+            tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
+
+        try: prompt_bin.unlink()
+        except Exception: pass
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        return JSONResponse({
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": req.model or MODEL_NAME,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": prompt_len,
+                      "output_tokens": len(tokens)},
+        })
+
     return app
 
 
@@ -643,9 +804,17 @@ def main():
                     help="Maximum context length (default: 16384; oversizing "
                          "this, e.g. 131072 on short prompts, can slow "
                          "attention 20×+ until issue #10 is fixed)")
+    ap.add_argument("--kv-f16", action="store_true",
+                    help="Force F16 KV cache. When --max-ctx > 6144 the server "
+                         "auto-enables Q4 KV to fit; pass --kv-f16 to opt out.")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-27B",
                     help="HF tokenizer id; Qwen3.6 shares this tokenizer.")
     args = ap.parse_args()
+
+    # Auto-enable Q4 KV cache when the requested context exceeds what F16 fits.
+    # setdefault so an explicit user DFLASH27B_KV_Q4=0 still wins.
+    if args.max_ctx > 6144 and not args.kv_f16:
+        os.environ.setdefault("DFLASH27B_KV_Q4", "1")
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")
