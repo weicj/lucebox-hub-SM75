@@ -25,35 +25,49 @@ def _int_env(name, default):
 
 
 arch = _detect_arch()
+is_blackwell = arch.startswith("sm_12")
 num_blocks = _int_env("MEGAKERNEL_NUM_BLOCKS", 82)
 block_size = _int_env("MEGAKERNEL_BLOCK_SIZE", 512)
 lm_num_blocks = _int_env("MEGAKERNEL_LM_NUM_BLOCKS", 512)
 lm_block_size = _int_env("MEGAKERNEL_LM_BLOCK_SIZE", 256)
+
+sources = [
+    "torch_bindings.cpp",
+    "kernel.cu",
+    "prefill.cu",
+]
+libraries = ["cublas"]
+cxx_args = ["-O3"]
+nvcc_args = [
+    "-O3",
+    f"-arch={arch}",
+    "--use_fast_math",
+    "-std=c++17",
+    f"-DNUM_BLOCKS={num_blocks}",
+    f"-DBLOCK_SIZE={block_size}",
+    f"-DLM_NUM_BLOCKS={lm_num_blocks}",
+    f"-DLM_BLOCK_SIZE={lm_block_size}",
+]
+
+if is_blackwell:
+    sources.append("kernel_gb10_nvfp4.cu")
+    # Exposed to both nvcc (for the Blackwell .cu files) and the host
+    # compiler (so torch_bindings.cpp registers the NVFP4 ops).
+    cxx_args.append("-DMEGAKERNEL_HAS_NVFP4")
+    nvcc_args.append("-DMEGAKERNEL_HAS_NVFP4")
+    libraries.append("cublasLt")
 
 setup(
     name="qwen35_megakernel_bf16",
     ext_modules=[
         CUDAExtension(
             name="qwen35_megakernel_bf16_C",
-            sources=[
-                "torch_bindings.cpp",
-                "kernel.cu",
-                "prefill.cu",
-            ],
+            sources=sources,
             extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": [
-                    "-O3",
-                    f"-arch={arch}",
-                    "--use_fast_math",
-                    "-std=c++17",
-                    f"-DNUM_BLOCKS={num_blocks}",
-                    f"-DBLOCK_SIZE={block_size}",
-                    f"-DLM_NUM_BLOCKS={lm_num_blocks}",
-                    f"-DLM_BLOCK_SIZE={lm_block_size}",
-                ],
+                "cxx": cxx_args,
+                "nvcc": nvcc_args,
             },
-            libraries=["cublas"],
+            libraries=libraries,
         ),
     ],
     cmdclass={"build_ext": BuildExtension},
