@@ -151,6 +151,48 @@ def find_prefix_boundary(ids, im_end_id, im_start_id, system_token_id):
     return -1
 
 
+def find_all_boundaries(ids, im_end_id, im_start_id, system_token_id):
+    """Return ascending list of candidate cut points for multi-slot caching.
+
+    Each cut point is the index AFTER an ``<|im_start|>`` that begins a new
+    role's content. The first cut is the system-prompt boundary (same as
+    ``find_prefix_boundary``); subsequent cuts are at every following
+    ``<|im_end|>`` + ``<|im_start|>`` pair.
+
+    Returns an empty list if no recognizable system message is found.
+    """
+    boundaries = []
+
+    # Locate the opening <|im_start|>system token.
+    sys_idx = -1
+    for i in range(len(ids) - 1):
+        if ids[i] == im_start_id:
+            if system_token_id is None or ids[i + 1] == system_token_id:
+                sys_idx = i
+                break
+    if sys_idx < 0:
+        return boundaries
+
+    # Walk forward from sys_idx: every time we see <|im_end|> followed
+    # (within 2 tokens) by <|im_start|>, record the position just after
+    # that <|im_start|> as a cache cut-point.
+    i = sys_idx + 1
+    while i < len(ids):
+        if ids[i] == im_end_id:
+            found_start = False
+            for j in range(i + 1, min(i + 3, len(ids))):
+                if ids[j] == im_start_id:
+                    boundaries.append(j + 1)
+                    i = j + 1
+                    found_start = True
+                    break
+            if not found_start:
+                break
+        else:
+            i += 1
+    return boundaries
+
+
 def hash_prefix(prefix_ids, kv_k_type, fa_window):
     """Stable SHA-1 (truncated 16 B) of (token ids, kv type, fa window)."""
     h = hashlib.sha1()
@@ -227,12 +269,20 @@ class PrefixCache:
     # ------------------------------------------------------------------
 
     def boundary(self, ids: list[int]) -> int:
+        """Return first boundary (system-prompt end), or -1. Legacy helper."""
         if self.disabled:
             return -1
         return find_prefix_boundary(ids, self.im_end, self.im_start, self.system_t)
 
+    def _all_boundaries(self, ids: list[int]) -> list[int]:
+        """Return all candidate cache cut-points in ascending order."""
+        return find_all_boundaries(ids, self.im_end, self.im_start, self.system_t)
+
     def lookup(self, prompt_ids: list[int]) -> tuple[int, int] | None:
-        """Return ``(slot_id, prefix_len)`` on cache hit, else ``None``.
+        """Return ``(slot_id, prefix_len)`` for the LONGEST cached prefix, or ``None``.
+
+        Iterates all block-aligned turn boundaries in ``prompt_ids``, checks
+        each against the LRU index, and returns the deepest (longest) match.
 
         The caller must already hold ``daemon_lock`` before inspecting the
         returned slot, since the slot id may be evicted by a concurrent
@@ -240,73 +290,100 @@ class PrefixCache:
         """
         if self.disabled:
             return None
-        b = self.boundary(prompt_ids)
-        if b <= 0:
-            return None
-        key = hash_prefix(prompt_ids[:b], self.kv_k_type, self.fa_window)
-        if key in self.entries:
-            self.entries.move_to_end(key)   # mark fresh
-            return self.entries[key], b
-        return None
+        candidates = self._all_boundaries(prompt_ids)
+        best: tuple[int, int] | None = None   # (slot_id, prefix_len)
+        for cut in candidates:
+            key = hash_prefix(prompt_ids[:cut], self.kv_k_type, self.fa_window)
+            if key in self.entries:
+                if best is None or cut > best[1]:
+                    best = (self.entries[key], cut)
+                self.entries.move_to_end(key)   # mark fresh
+        if best is not None:
+            print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
+                  f"(of {len(prompt_ids)} total)", flush=True)
+        return best
 
-    async def maybe_snapshot(self, prompt_ids: list[int],
-                              token_stream_consumer=None) -> None:
-        """Snapshot the daemon's KV state at the cacheable prefix boundary.
+    def prepare_inline_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
+        """Pick a target boundary + slot for inline snapshot during the next
+        request. Returns ``(slot_id, target_cut)`` or ``None`` if no
+        snapshot is needed (e.g. boundary already cached).
 
-        Implementation pattern: rather than try to take a snapshot at end-of-
-        generation (where ``cache.cur_pos`` is well past the prefix boundary),
-        we issue a SECOND prefill pass of the prefix-only token stream with
-        ``n_gen=0``. This costs one extra system-prompt prefill on cold turns
-        but guarantees the snapshot's ``cur_pos`` exactly matches the
-        cache-key prefix length. Subsequent turns hit the cache and skip the
-        whole system-prompt prefill, recovering the cost many times over.
+        Caller must:
+          1. Append ``snap=<target_cut>:<slot_id>`` to the daemon command
+             that runs the actual response (bare prompt OR ``RESTORE``).
+          2. After the daemon emits ``[snap] inline slot=N cur_pos=M``
+             during prefill, call ``confirm_inline_snap(slot_id, target_cut,
+             prompt_ids)`` to register the entry in the LRU.
 
-        Caller must hold ``daemon_lock``.  ``token_stream_consumer`` is an
-        async callable (or None) that drains the daemon's stream-fd token
-        output for the prefill pass; pass the same drainer as the request
-        handler so the ``-1`` sentinel is consumed cleanly.
+        For an agent loop that monotonically grows conversation history, the
+        most valuable cache point is "end of the most recent completed
+        assistant message" — i.e., the second-to-last `<|im_start|>`
+        boundary. The LAST boundary is the current turn's opening, whose
+        content hasn't been generated yet.
         """
         if self.disabled:
-            return
-        b = self.boundary(prompt_ids)
-        if b <= 0:
-            return
-        key = hash_prefix(prompt_ids[:b], self.kv_k_type, self.fa_window)
-        if key in self.entries:
-            return  # already cached
+            return None
+        candidates = self._all_boundaries(prompt_ids)
+        if not candidates:
+            return None
+        target_cut = candidates[-2] if len(candidates) >= 2 else candidates[-1]
 
-        # Evict LRU entry if at capacity.
+        target_key = hash_prefix(prompt_ids[:target_cut],
+                                  self.kv_k_type, self.fa_window)
+        if target_key in self.entries:
+            self.entries.move_to_end(target_key)
+            return None   # already cached
+
+        # Pick slot: reuse LRU eviction's slot if at cap, else next free.
         if len(self.entries) >= self.cap:
             old_key, old_slot = self.entries.popitem(last=False)
-            self._send(f"FREE_SNAPSHOT {old_slot}\n")
-            await self._await_reply("[snap] freed slot=")
-            slot = old_slot
+            slot = old_slot   # daemon will overwrite this slot in-place
         else:
             slot = self.next_slot
             self.next_slot = (self.next_slot + 1) % self.cap
 
-        # Write the prefix-only tokens to a temp file and prefill them with
-        # n_gen=0 so the daemon ends with cur_pos == prefix length.
+        return (slot, target_cut)
+
+    def confirm_inline_snap(self, slot: int, target_cut: int,
+                             prompt_ids: list[int]) -> None:
+        """Register an inline snapshot in the LRU after the daemon has
+        successfully fired ``[snap] inline``. Called from the caller after
+        the actual response stream completes."""
+        if self.disabled:
+            return
+        key = hash_prefix(prompt_ids[:target_cut],
+                          self.kv_k_type, self.fa_window)
+        self.entries[key] = slot
+        print(f"{self.log_prefix} inline-snap committed slot={slot} "
+              f"prefix_len={target_cut}", flush=True)
+
+    # Legacy out-of-band snapshot (kept for backward-compatibility tests
+    # that call it directly; new code uses prepare_inline_snap +
+    # confirm_inline_snap so the snapshot rides on the actual response).
+    async def maybe_snapshot(self, prompt_ids: list[int],
+                              token_stream_consumer=None) -> None:
+        if self.disabled:
+            return
+        prep = self.prepare_inline_snap(prompt_ids)
+        if prep is None:
+            return
+        slot, cut = prep
+
         import os, struct, tempfile
         fd, tmp_path = tempfile.mkstemp(suffix="_prefix.bin")
         with os.fdopen(fd, "wb") as f:
-            for t in prompt_ids[:b]:
+            for t in prompt_ids[:cut]:
                 f.write(struct.pack("<i", int(t)))
         try:
             self._send(f"{tmp_path} 0\n")
-            # Drain the prefill's token stream (just the -1 sentinel since
-            # n_gen=0 means no real tokens). Caller-supplied drainer.
             if token_stream_consumer is not None:
                 await token_stream_consumer()
-
             self._send(f"SNAPSHOT {slot}\n")
             await self._await_reply("[snap] slot=")
         finally:
             try: os.unlink(tmp_path)
             except OSError: pass
-
-        self.entries[key] = slot
-        print(f"{self.log_prefix} snapshot slot={slot} prefix_len={b}", flush=True)
+        self.confirm_inline_snap(slot, cut, prompt_ids)
 
     async def startup_sync(self) -> None:
         """Query the daemon for existing slots and free them all.

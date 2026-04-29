@@ -296,6 +296,16 @@ struct PrefixSnapshot {
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // Phase B: thin-mode snapshots cover only a KV-position range.
+    bool is_thin  = false;
+    int  kv_start = 0;     // inclusive (only meaningful when is_thin)
+    int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
+    // When is_thin == true:
+    //   - attn_k_snap[i] / attn_v_snap[i] are sized
+    //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
+    //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
+    //     allocated (THIN snapshots are KV-only).
 };
 
 // Snapshot the slim state of `cache` into `snap`. Allocates device buffers
@@ -315,6 +325,28 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
+
+// Thin snapshot: capture only KV slice [kv_start, kv_end).
+// SSM/conv/target_feat are not preserved (caller chains thin entries
+// onto a thick base via restore_target_cache_chain).
+bool snapshot_target_cache_thin(const TargetWeights & w,
+                                 const TargetCache & cache,
+                                 ggml_backend_t backend,
+                                 int kv_start,
+                                 int kv_end,
+                                 PrefixSnapshot & snap);
+
+// Restore from a thick base then layer in zero or more thin entries.
+// thick may be nullptr if you only want the thin layers; in that case
+// cache must already hold the right base (only safe for testing).
+// Each thin's [kv_start, kv_end) range is copied into cache.attn_k[i] /
+// attn_v[i] at the appropriate offset. Out-of-order thins are allowed
+// (later thins overwrite earlier ones in overlapping ranges); chain
+// caller must walk in time order to be deterministic.
+bool restore_target_cache_chain(const PrefixSnapshot * thick,
+                                 const PrefixSnapshot * const * thins,
+                                 int n_thins,
+                                 TargetCache & cache);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
