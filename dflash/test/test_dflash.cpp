@@ -49,6 +49,11 @@ extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
 #include <cmath>
 #include <cstdint>
 
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#define unsetenv(name) _putenv_s(name, "")
+#endif
+
 #if defined(_WIN32)
 #if !defined(NOMINMAX)
 #define NOMINMAX
