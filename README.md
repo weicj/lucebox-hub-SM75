@@ -122,7 +122,7 @@ Supported out of the box; the build just needs the right CUDA toolkit. `dflash/C
 | GPU | Arch | Min CUDA | Status |
 |-----|:----:|:--------:|--------|
 | RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
-| RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 33 tok/s DFlash verified |
+| RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 53 tok/s DFlash verified (FP16 draft) |
 | RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |
 | RTX 5090 Blackwell consumer | `sm_120` | 12.8 | supported, auto-added by CMake |
 | DGX Spark / GB10 | `sm_121` (compute capability 12.1) | 12.9 | supported, auto-added by CMake |
