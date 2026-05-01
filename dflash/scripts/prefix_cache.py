@@ -28,11 +28,37 @@ Usage:
         ...
         # after daemon finishes, snapshot for future cache hits:
         await pc.maybe_snapshot(prompt_ids, kv_k_type, fa_window)
+
+Option 3 — full-compress-result cache:
+    When pFlash compression is enabled, the prefix-cache path above silently
+    no-ops because compressed tokens lack Qwen chat-template markers.  The
+    full-cache path caches the compressed cur_bin keyed on the ORIGINAL raw
+    prompt token IDs, so that an identical long prompt sent a second time skips
+    BOTH the drafter compression dance AND the target prefill.
+
+    full_hit = pc.lookup_full(prompt_ids)
+    if full_hit:
+        slot, cached_cur_bin, cur_ids_len = full_hit
+        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\\n"
+    else:
+        cur_bin, cur_ids = _maybe_compress(...)
+        if cur_bin != prompt_bin:          # compression actually fired
+            prep = pc.prepare_full_snap(prompt_ids)
+            if prep:
+                slot, _ = prep
+                cmd_line = f"{cur_bin} {gen_len} snap={len(cur_ids)}:{slot}\\n"
+        # ...after response completes:
+        pc.confirm_full_snap(slot, prompt_ids, cur_bin, len(cur_ids))
+        # on exception:
+        pc.abort_full_snap(slot)
 """
 import asyncio
 import hashlib
+import os
+import shutil
 import struct
 from collections import OrderedDict
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +412,175 @@ class PrefixCache:
         if self.disabled:
             return
         self._pending_evict_key = None
+
+    # ------------------------------------------------------------------
+    # Option 3: full-compress-result cache
+    # ------------------------------------------------------------------
+    # When pFlash compression is enabled the existing prefix-cache path above
+    # silently no-ops (compressed tokens lack Qwen chat-template markers so
+    # find_all_boundaries returns []).  The full-cache path solves this by
+    # caching the compressed cur_bin keyed on the ORIGINAL raw prompt_ids so
+    # that an identical long prompt sent a second time skips BOTH the drafter
+    # dance AND the target prefill.
+    #
+    # Slot allocation: prefix-cache uses slots [0, cap); full-cache uses slots
+    # [cap, cap + full_cap).  Both are initialised at PrefixCache construction
+    # time; the daemon cap (8) is shared, so prefix_cap + full_cap <= 8.
+    # ------------------------------------------------------------------
+
+    def init_full_cache(self, full_cap: int,
+                        cache_dir: str | None = None) -> None:
+        """Initialise the full-cache pool.  Must be called once after __init__
+        if you want Option 3 to be active.  Idempotent if called again with
+        the same parameters.
+
+        Parameters
+        ----------
+        full_cap:
+            Number of daemon slots reserved for full-cache entries.
+            prefix_cap (self.cap) + full_cap must not exceed DAEMON_MAX_SLOTS.
+        cache_dir:
+            Directory to persist cur_bin files across requests.
+            Defaults to /tmp/dflash-pflash-cache/.
+        """
+        if self.disabled or full_cap <= 0:
+            self._full_cap = 0
+            self._full_disabled = True
+            return
+
+        remaining = self.DAEMON_MAX_SLOTS - self.cap
+        if full_cap > remaining:
+            print(f"{self.log_prefix} full-cache cap={full_cap} would exceed "
+                  f"daemon limit (prefix uses {self.cap}); clamping to {remaining}",
+                  flush=True)
+            full_cap = remaining
+        if full_cap <= 0:
+            self._full_cap = 0
+            self._full_disabled = True
+            return
+
+        self._full_cap = full_cap
+        self._full_disabled = False
+        # Slots used by the full-cache start AFTER the prefix-cache slots.
+        self._full_slot_base = self.cap
+        self._full_next_slot = 0  # relative; absolute = _full_slot_base + _full_next_slot
+        # LRU map: prompt_ids_hash -> (absolute_slot, cached_cur_bin_path, cur_ids_len)
+        self.full_entries: OrderedDict[bytes, tuple[int, str, int]] = OrderedDict()
+        # Pending eviction: the LRU entry reserved for the next confirm.
+        self._full_pending_evict_key: bytes | None = None
+        self._full_pending_evict_path: str | None = None
+
+        cache_dir_path = Path(cache_dir) if cache_dir else Path("/tmp/dflash-pflash-cache")
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        self._full_cache_dir = cache_dir_path
+        print(f"{self.log_prefix} full-cache enabled: cap={full_cap} "
+              f"slots=[{self._full_slot_base},{self._full_slot_base + full_cap}) "
+              f"dir={cache_dir_path}", flush=True)
+
+    def lookup_full(self, prompt_ids: list[int]) -> tuple[int, str, int] | None:
+        """Exact-match on full prompt_ids hash (keyed on raw, pre-compression ids).
+
+        Returns ``(slot, cached_cur_bin_path, cur_ids_len)`` on hit, else None.
+        The cur_bin_path points to a file in the persistent cache dir that the
+        caller passes directly to the daemon as a RESTORE command's second arg.
+
+        Caller must hold daemon_lock before inspecting the returned slot.
+        """
+        if getattr(self, "_full_disabled", True):
+            return None
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        entry = self.full_entries.get(key)
+        if entry is None:
+            return None
+        slot, cur_bin_path, cur_ids_len = entry
+        # Verify the cached file still exists (could have been deleted externally).
+        if not Path(cur_bin_path).exists():
+            self.full_entries.pop(key, None)
+            return None
+        self.full_entries.move_to_end(key)  # mark fresh in LRU
+        print(f"{self.log_prefix} full-cache hit slot={slot} "
+              f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
+        return slot, cur_bin_path, cur_ids_len
+
+    def prepare_full_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
+        """Reserve a daemon slot for the full-prefill snapshot.
+
+        Returns ``(absolute_slot, 0)`` — the second element is a placeholder;
+        the real target_pos (== len(cur_ids)) is supplied by the caller to
+        ``confirm_full_snap``.  Returns None if full-cache is disabled or the
+        prompt is already cached.
+        """
+        if getattr(self, "_full_disabled", True):
+            return None
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        if key in self.full_entries:
+            self.full_entries.move_to_end(key)
+            return None  # already cached
+
+        # Pick a slot, deferring eviction until confirm succeeds.
+        if len(self.full_entries) >= self._full_cap:
+            old_key = next(iter(self.full_entries))
+            old_slot, old_path, _ = self.full_entries[old_key]
+            self._full_pending_evict_key = old_key
+            self._full_pending_evict_path = old_path
+            abs_slot = old_slot
+        else:
+            abs_slot = self._full_slot_base + self._full_next_slot
+            self._full_next_slot = (self._full_next_slot + 1) % self._full_cap
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+
+        return abs_slot, 0  # 0 is a placeholder; real pos passed to confirm
+
+    def confirm_full_snap(self, slot: int, prompt_ids: list[int],
+                          cur_bin_src: str | Path, cur_ids_len: int) -> None:
+        """Persist cur_bin_src into the cache dir and register the entry.
+
+        ``cur_bin_src`` is the path to the tempfile written by _maybe_compress;
+        its content is copied (not moved, to keep the original available for the
+        daemon) into the persistent cache dir before registering.
+
+        Atomically evicts the LRU entry (and its on-disk file) if one was
+        reserved by prepare_full_snap.
+        """
+        if getattr(self, "_full_disabled", True):
+            return
+
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        dest = self._full_cache_dir / (key.hex() + ".bin")
+
+        try:
+            shutil.copy2(str(cur_bin_src), str(dest))
+        except OSError as exc:
+            print(f"{self.log_prefix} full-cache: failed to copy cur_bin "
+                  f"({cur_bin_src} -> {dest}): {exc}", flush=True)
+            # Don't evict the old entry — leave cache consistent.
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+            return
+
+        # Atomically evict the reserved entry (if any) and insert new one.
+        if self._full_pending_evict_key is not None:
+            evicted_path = self._full_pending_evict_path
+            self.full_entries.pop(self._full_pending_evict_key, None)
+            if evicted_path:
+                Path(evicted_path).unlink(missing_ok=True)
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+
+        self.full_entries[key] = (slot, str(dest), cur_ids_len)
+        print(f"{self.log_prefix} full-cache committed slot={slot} "
+              f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
+
+    def abort_full_snap(self, slot: int) -> None:
+        """Cancel a prepare_full_snap reservation without registering anything.
+
+        Clears the pending eviction so the old LRU entry is not evicted.
+        """
+        if getattr(self, "_full_disabled", True):
+            return
+        self._full_pending_evict_key = None
+        self._full_pending_evict_path = None
 
     # Legacy out-of-band snapshot (kept for backward-compatibility tests
     # that call it directly; new code uses prepare_inline_snap +
