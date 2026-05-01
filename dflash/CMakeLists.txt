@@ -59,14 +59,14 @@ add_library(dflash27b STATIC
     src/qwen3_drafter.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
-    src/flashprefill_kernels.cu
-    src/flashprefill_select.cpp
-    src/flashprefill.cpp
+    src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
+# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
+# the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
 # run the spec-prefill stack or are building for sm<80 (cutlass BSA kernels
@@ -101,6 +101,16 @@ list(GET _dflash27b_archs 0 _dflash27b_min_sm)
 # Strip any trailing 'a' suffix (e.g. "121a" → "121")
 string(REGEX REPLACE "[^0-9]" "" _dflash27b_min_sm "${_dflash27b_min_sm}")
 target_compile_definitions(dflash27b PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
+
+# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+).
+# On sm_75 the drafter falls back to ggml's flash_attn_ext (see qwen3_0p6b_graph.cpp).
+if(_dflash27b_min_sm GREATER_EQUAL 80)
+    target_sources(dflash27b PRIVATE
+        src/flashprefill_kernels.cu
+        src/flashprefill_select.cpp
+        src/flashprefill.cpp)
+    target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_FLASHPREFILL=1)
+endif()
 
 # BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
 # on legacy arches with a clear message instead of failing the link.

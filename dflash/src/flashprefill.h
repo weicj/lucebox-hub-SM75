@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include "ggml-backend.h"
 
 namespace dflash27b {
 namespace flashprefill {
@@ -53,6 +54,22 @@ int flash_prefill_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
     float scale,
+    const FlashPrefillConfig & cfg);
+
+// ggml flash_attn_ext-based implementation. Works on all SM targets (75+).
+// Same interface as flash_prefill_forward_bf16 but uses ggml's FA internally
+// (chunked causal attention). Accepts BF16/F16 Q/K/V tensors stored in the
+// same [B, S, H, D] contiguous layout. No custom WMMA kernels needed.
+//
+// On SM < 80 this is the only available path (BF16 WMMA doesn't exist).
+// On SM >= 80 callers may prefer flash_prefill_forward_bf16 for the
+// block-sparse selection + custom WMMA kernel path.
+int flash_prefill_forward_q8(
+    ggml_backend_t backend,
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    int elem_size,
     const FlashPrefillConfig & cfg);
 
 #ifdef DFLASH27B_HAVE_BSA
