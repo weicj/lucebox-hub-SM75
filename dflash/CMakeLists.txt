@@ -178,6 +178,14 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
      )
 endif()
 
+# PFlash phase-split harness
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
+    add_executable(pflash_daemon test/pflash_daemon.cpp)
+    target_include_directories(pflash_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(pflash_daemon PRIVATE dflash27b ggml ggml-cuda)
+endif()
+
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)

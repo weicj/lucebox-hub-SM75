@@ -51,6 +51,51 @@ DFLASH_FP_PROFILE=1    # log mean/score/select/forward stage timings
 
 See `src/flashprefill.h` for the full list and defaults.
 
+## Dual-GPU PFlash phase split
+
+PFlash targets the prefill side of long-context requests. The dual-GPU phase
+split harness is an opt-in benchmark/runtime path for measuring the PFlash
+prefill phase as its own resident CUDA process:
+
+- `pflash_daemon` keeps the Qwen3-0.6B PFlash drafter resident.
+- `scripts/phase_split_dual_gpu.py` sends counted token IDs to the daemon.
+- `--pflash-gpu` selects the CUDA GPU used for the PFlash phase.
+- The report records compressed token/text outputs, PFlash timing, and GPU
+  resource peaks for the PFlash worker.
+
+The harness produces the compressed prompt artifact used by later target
+prefill experiments. It does not measure or modify decode.
+
+Build:
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target pflash_daemon -j
+```
+
+Run a synthetic NIAH sweep:
+
+```
+python scripts/phase_split_dual_gpu.py bench-niah \
+  --build-dir build \
+  --contexts 4096,8192,16384 \
+  --local-files-only \
+  --report-dir reports/pflash_phase_split_context_sweep
+```
+
+Compress a real prompt:
+
+```
+python scripts/phase_split_dual_gpu.py run-prompt \
+  --build-dir build \
+  --prompt-file /path/to/prompt.txt \
+  --local-files-only \
+  --report-dir reports/pflash_phase_split_prompt
+```
+
+The reports include source token count, compressed token count, compression
+ratio, PFlash timing, and GPU resource peaks.
+
 ## Performance
 
 NIAH single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
