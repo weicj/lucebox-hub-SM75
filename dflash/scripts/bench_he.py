@@ -228,7 +228,9 @@ def tokenize_prompt(prompt: str, out_path: Path, tokenizer) -> int:
 def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
                     ddtree_budget: int | None = None,
                     ddtree_temp: float | None = None,
-                    ddtree_no_chain_seed: bool = False) -> dict:
+                    ddtree_no_chain_seed: bool = False,
+                    extra_args: list[str] | None = None,
+                    extra_env: dict[str, str] | None = None) -> dict:
     out_bin = TMPDIR / "he_bench_out.bin"
     cmd = [
         TEST_DFLASH, TARGET, DRAFT, str(prompt_path), str(n_gen), str(out_bin),
@@ -242,7 +244,12 @@ def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
         cmd.append(f"--ddtree-temp={ddtree_temp}")
     if ddtree_no_chain_seed:
         cmd.append("--ddtree-no-chain-seed")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if extra_args:
+        cmd.extend(extra_args)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
     if r.returncode != 0:
         print("STDERR:", r.stderr[-2000:])
         raise RuntimeError(f"test_dflash exited {r.returncode}")
@@ -282,6 +289,14 @@ def main():
                     help="Sharpen draft logits with this temperature (T<1 widens top-1/top-2 gap)")
     ap.add_argument("--ddtree-no-chain-seed", action="store_true",
                     help="Use paper's pure best-first (no chain pre-seed)")
+    ap.add_argument("--draft-feature-mirror", action="store_true",
+                    help="Use the draft-side target feature mirror path")
+    ap.add_argument("--target-gpu", type=int, default=None,
+                    help="Visible CUDA device id for the target backend")
+    ap.add_argument("--draft-gpu", type=int, default=None,
+                    help="Visible CUDA device id for the draft backend")
+    ap.add_argument("--cuda-visible-devices", default=None,
+                    help="Optional CUDA_VISIBLE_DEVICES override for test_dflash")
     args = ap.parse_args()
 
     print(f"[bench] target = {TARGET}")
@@ -304,6 +319,18 @@ def main():
     print(f"{'prompt':28s}  {'steps':>6s} {'AL':>6s} {'pct%':>6s} {'tok/s':>8s}")
     print("-" * 62)
 
+    extra_args = []
+    if args.draft_feature_mirror:
+        extra_args.append("--draft-feature-mirror")
+    if args.target_gpu is not None:
+        extra_args.append(f"--target-gpu={args.target_gpu}")
+    if args.draft_gpu is not None:
+        extra_args.append(f"--draft-gpu={args.draft_gpu}")
+
+    extra_env = {}
+    if args.cuda_visible_devices:
+        extra_env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
     results = []
     for i, (name, _) in enumerate(PROMPTS):
         path = _prompt_path(i)
@@ -312,7 +339,9 @@ def main():
                                 fast_rollback=(args.mode == "fast"),
                                 ddtree_budget=args.ddtree_budget,
                                 ddtree_temp=args.ddtree_temp,
-                                ddtree_no_chain_seed=args.ddtree_no_chain_seed)
+                                ddtree_no_chain_seed=args.ddtree_no_chain_seed,
+                                extra_args=extra_args,
+                                extra_env=extra_env)
         except Exception as e:
             print(f"  [{i:02d}] {name:26s}  FAILED: {e}")
             continue
