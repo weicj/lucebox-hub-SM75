@@ -947,9 +947,19 @@ int main(int argc, char ** argv) {
     std::printf("[target] %s\n", dflash27b_last_error());
 
     DraftWeights dw;
-    if (!load_draft_safetensors(draft_path, backend, dw)) {
-        std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
-        return 1;
+    {
+        // Auto-detect draft format: .gguf → GGUF loader, else safetensors.
+        std::string dp(draft_path);
+        bool draft_ok = false;
+        if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
+            draft_ok = load_draft_gguf(draft_path, backend, dw);
+        } else {
+            draft_ok = load_draft_safetensors(draft_path, backend, dw);
+        }
+        if (!draft_ok) {
+            std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
+            return 1;
+        }
     }
     std::printf("[draft]  loaded\n");
 

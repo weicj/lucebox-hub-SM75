@@ -34,7 +34,9 @@
 #include "internal.h"
 #include "flashprefill.h"
 
+#if DFLASH27B_MIN_SM >= 80
 #include <cuda_runtime.h>
+#endif
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -144,18 +146,25 @@ bool forward_qwen3_0p6b_drafter(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
+        // Use BF16 on Ampere+ (native tensor core support), F16 on Turing.
+        const ggml_type half_type =
+#if DFLASH27B_MIN_SM >= 80
+            GGML_TYPE_BF16;
+#else
+            GGML_TYPE_F16;
+#endif
         if (!make_pers(w.backend, GGML_TYPE_F32,  2, d_h, hidden_buf) ||
             !make_pers(w.backend, GGML_TYPE_I32,  1, d_p, pos_buf)    ||
             !make_pers(w.backend, GGML_TYPE_F32,  2, d_mt, mask_tail_buf) ||
-            !make_pers(w.backend, GGML_TYPE_BF16, 3, d_q, Q_buf) ||
-            !make_pers(w.backend, GGML_TYPE_BF16, 3, d_q, attn_out_buf)) {
+            !make_pers(w.backend, half_type, 3, d_q, Q_buf) ||
+            !make_pers(w.backend, half_type, 3, d_q, attn_out_buf)) {
             set_last_error("forward_qwen3_0p6b: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
             cleanup_all();
             return false;
         }
         for (int il = 0; il < w.n_layer; ++il) {
-            if (!make_pers(w.backend, GGML_TYPE_BF16, 3, d_kv, K_curr_v[il]) ||
-                !make_pers(w.backend, GGML_TYPE_BF16, 3, d_kv, V_curr_v[il]) ||
+            if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il]) ||
+                !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il]) ||
                 !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
                 set_last_error("forward_qwen3_0p6b: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
@@ -211,12 +220,11 @@ bool forward_qwen3_0p6b_drafter(
         ggml_free(gctx);
     }
 
-    // Per-layer A→FP→B loop. No chunking; FP runs over full S each layer.
+    // Per-layer A→FA→B loop.
     ggml_gallocr_t galloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(w.backend));
 
     flashprefill::FlashPrefillConfig fp_cfg;
-    // Tunable alpha via env (default 0.12). Higher = stricter selection = fewer blocks.
     if (const char* a = std::getenv("DFLASH_FP_ALPHA")) {
         float v = (float)std::atof(a);
         if (v > 0.0f && v < 1.0f) fp_cfg.alpha = v;
@@ -313,24 +321,52 @@ bool forward_qwen3_0p6b_drafter(
             ggml_free(gA);
         }
 
-        // ── FP CUDA call: attn = flash_prefill(Q, K, V) ──
+        // ── Attention dispatch ──
+        // Use the ggml FA path (flash_prefill_forward_q8) when:
+        //   - SM < 80 (BF16 WMMA unavailable), OR
+        //   - The drafter's persistent buffers are not BF16 (e.g. F16 on Turing)
+        // Use the custom BF16 WMMA path on SM >= 80 with BF16 buffers.
         auto tF0 = std::chrono::steady_clock::now();
-        int rc = flashprefill::flash_prefill_forward_bf16(
-            Q_buf.t->data,
-            K_curr_v[il].t->data,
-            V_curr_v[il].t->data,
-            attn_out_buf.t->data,
-            1, S, H, Hk, D, scale, fp_cfg);
-        if (rc != 0) {
-            set_last_error("flash_prefill_forward_bf16 failed at layer " + std::to_string(il));
-            ggml_gallocr_free(galloc); cleanup_all(); return false;
+        const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
+#if DFLASH27B_MIN_SM >= 80
+                                 && true;
+#else
+                                 && false;  // WMMA kernels not compiled
+#endif
+        if (use_bf16_fp) {
+#if DFLASH27B_MIN_SM >= 80
+            int rc = flashprefill::flash_prefill_forward_bf16(
+                Q_buf.t->data,
+                K_curr_v[il].t->data,
+                V_curr_v[il].t->data,
+                attn_out_buf.t->data,
+                1, S, H, Hk, D, scale, fp_cfg);
+            if (rc != 0) {
+                set_last_error("flash_prefill_forward_bf16 failed at layer " + std::to_string(il));
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                set_last_error(std::string("flash_prefill cuda error: ") + cudaGetErrorString(e));
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaDeviceSynchronize();
+#endif
+        } else {
+            int rc = flashprefill::flash_prefill_forward_q8(
+                w.backend,
+                Q_buf.t->data,
+                K_curr_v[il].t->data,
+                V_curr_v[il].t->data,
+                attn_out_buf.t->data,
+                1, S, H, Hk, D, scale,
+                (int)ggml_element_size(Q_buf.t),
+                fp_cfg);
+            if (rc != 0) {
+                set_last_error("flash_prefill_forward_q8 failed at layer " + std::to_string(il));
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
         }
-        cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            set_last_error(std::string("flash_prefill cuda error: ") + cudaGetErrorString(e));
-            ggml_gallocr_free(galloc); cleanup_all(); return false;
-        }
-        cudaDeviceSynchronize();
         auto tF1 = std::chrono::steady_clock::now();
         t_fp += std::chrono::duration<double>(tF1 - tF0).count();
 

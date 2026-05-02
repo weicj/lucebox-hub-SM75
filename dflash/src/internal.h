@@ -168,6 +168,12 @@ bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t backend,
                             DraftWeights & out);
 
+// Load a Q8_0 (or F16) draft model from a GGUF file on disk.
+// Alternative to load_draft_safetensors for quantized drafts.
+bool load_draft_gguf(const std::string & path,
+                     ggml_backend_t backend,
+                     DraftWeights & out);
+
 void free_draft_weights(DraftWeights & w);
 
 // ─── Target cache (persistent state between forward calls) ────────
