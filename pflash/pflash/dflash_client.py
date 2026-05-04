@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 class DflashClient:
     def __init__(self, bin_path: str, target_path: str, draft_path: str,
                  max_ctx: int = 16384, ddtree_budget: int = 16,
+                 *,
                  ddtree_temp: Optional[float] = None,
                  chain_seed: bool = True,
                  fa_window: Optional[int] = None,
