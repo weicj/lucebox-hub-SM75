@@ -465,9 +465,11 @@ struct StepGraph {
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
+    ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
 
     // Output
     ggml_tensor *   logits = nullptr;
+    ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
     ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
     ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
 
@@ -478,6 +480,195 @@ struct StepGraph {
     // Marked as graph outputs so their data is valid after ggml_backend_graph_compute.
     std::vector<DeltaNetCapture> delta_captures;
 };
+
+struct DraftFeatureMirror {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor * target_feat = nullptr; // F32 [5*hidden, cap]
+    void * bf16_staging = nullptr;
+    size_t bf16_staging_elems = 0;
+    int device = 0;
+    int target_device = 0;
+    int cap = 0;
+};
+
+static bool enable_peer_access_one_way(int device, int peer) {
+    if (device == peer) return true;
+    int can_access = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, device, peer);
+    if (err != cudaSuccess || !can_access) return false;
+    err = cudaSetDevice(device);
+    if (err != cudaSuccess) return false;
+    err = cudaDeviceEnablePeerAccess(peer, 0);
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+        return true;
+    }
+    return err == cudaSuccess;
+}
+
+static bool enable_peer_access_pair(int a, int b) {
+    if (a == b) return true;
+    const bool ab = enable_peer_access_one_way(a, b);
+    const bool ba = enable_peer_access_one_way(b, a);
+    return ab && ba;
+}
+
+static bool copy_peer_async(void * dst, int dst_device,
+                            const void * src, int src_device,
+                            size_t bytes,
+                            cudaStream_t stream = nullptr) {
+    if (bytes == 0) return true;
+    cudaError_t err = cudaSuccess;
+    if (dst_device == src_device) {
+        err = cudaSetDevice(dst_device);
+        if (err != cudaSuccess) return false;
+        err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
+    } else {
+        err = cudaSetDevice(dst_device);
+        if (err != cudaSuccess) return false;
+        err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
+    }
+    return err == cudaSuccess;
+}
+
+static bool ensure_bf16_staging(DraftFeatureMirror & mirror, size_t elems) {
+    if (elems <= mirror.bf16_staging_elems) return true;
+    cudaError_t err = cudaSetDevice(mirror.device);
+    if (err != cudaSuccess) return false;
+    if (mirror.bf16_staging) {
+        cudaFree(mirror.bf16_staging);
+        mirror.bf16_staging = nullptr;
+        mirror.bf16_staging_elems = 0;
+    }
+    err = cudaMalloc(&mirror.bf16_staging, elems * sizeof(uint16_t));
+    if (err != cudaSuccess) return false;
+    mirror.bf16_staging_elems = elems;
+    return true;
+}
+
+static void draft_feature_mirror_free(DraftFeatureMirror & mirror) {
+    if (mirror.bf16_staging) {
+        cudaSetDevice(mirror.device);
+        cudaFree(mirror.bf16_staging);
+        mirror.bf16_staging = nullptr;
+        mirror.bf16_staging_elems = 0;
+    }
+    if (mirror.buf) {
+        ggml_backend_buffer_free(mirror.buf);
+        mirror.buf = nullptr;
+    }
+    if (mirror.ctx) {
+        ggml_free(mirror.ctx);
+        mirror.ctx = nullptr;
+    }
+    mirror.target_feat = nullptr;
+    mirror.device = 0;
+    mirror.target_device = 0;
+    mirror.cap = 0;
+}
+
+static bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
+                                      ggml_backend_t backend,
+                                      int device,
+                                      int target_device,
+                                      int cap) {
+    draft_feature_mirror_free(mirror);
+    if (cap <= 0) return false;
+    mirror.device = device;
+    mirror.target_device = target_device;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4 + 16 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    mirror.ctx = ggml_init(ip);
+    if (!mirror.ctx) return false;
+
+    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
+    mirror.target_feat = ggml_new_tensor_2d(mirror.ctx, GGML_TYPE_F32, fc_in, cap);
+    ggml_set_name(mirror.target_feat, "draft_target_feat_mirror");
+    mirror.buf = ggml_backend_alloc_ctx_tensors(mirror.ctx, backend);
+    if (!mirror.buf) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    const size_t bytes = (size_t)fc_in * (size_t)cap * sizeof(float);
+    cudaSetDevice(device);
+    cudaError_t err = cudaMemset(mirror.target_feat->data, 0, bytes);
+    if (err != cudaSuccess) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    mirror.cap = cap;
+    return true;
+}
+
+static bool draft_feature_mirror_can_view(const DraftFeatureMirror & mirror,
+                                          int committed,
+                                          int ctx_len,
+                                          int & slot0) {
+    if (!mirror.target_feat || mirror.cap <= 0) return false;
+    if (ctx_len <= 0 || ctx_len > mirror.cap || committed < ctx_len) return false;
+    const int start = committed - ctx_len;
+    slot0 = start % mirror.cap;
+    return slot0 + ctx_len <= mirror.cap;
+}
+
+static bool draft_feature_mirror_sync_range(const TargetCache & cache,
+                                            const DraftFeatureMirror & mirror,
+                                            int start_pos,
+                                            int n_tokens) {
+    if (!cache.target_feat || !mirror.target_feat || mirror.cap <= 0) return false;
+    if (n_tokens <= 0) return true;
+    if (n_tokens > mirror.cap) return false;
+
+    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
+    const int src_cap = cache.target_feat_cap;
+    const size_t src_stride = cache.target_feat->nb[1];
+    const size_t dst_stride = mirror.target_feat->nb[1];
+
+    int done = 0;
+    while (done < n_tokens) {
+        const int src_slot = (start_pos + done) % src_cap;
+        const int dst_slot = (start_pos + done) % mirror.cap;
+        const int src_run = src_cap - src_slot;
+        const int dst_run = mirror.cap - dst_slot;
+        const int run = std::min(n_tokens - done, std::min(src_run, dst_run));
+        const size_t elems = (size_t)run * (size_t)fc_in;
+        const void * src =
+            (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
+        void * dst =
+            (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
+        if (mirror.device == mirror.target_device) {
+            cudaSetDevice(mirror.device);
+            dflash27b_launch_bf16_to_f32(src, dst, elems, nullptr);
+        } else {
+            DraftFeatureMirror & mutable_mirror =
+                const_cast<DraftFeatureMirror &>(mirror);
+            if (!ensure_bf16_staging(mutable_mirror, elems)) return false;
+            if (!copy_peer_async(mirror.bf16_staging, mirror.device,
+                                 src, mirror.target_device,
+                                 elems * sizeof(uint16_t))) {
+                return false;
+            }
+            cudaSetDevice(mirror.device);
+            dflash27b_launch_bf16_to_f32(mirror.bf16_staging, dst, elems, nullptr);
+        }
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return false;
+        done += run;
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+static bool draft_feature_mirror_sync_tail(const TargetCache & cache,
+                                           const DraftFeatureMirror & mirror,
+                                           int committed) {
+    if (!mirror.target_feat || committed <= 0) return true;
+    const int n = std::min(committed, mirror.cap);
+    return draft_feature_mirror_sync_range(cache, mirror, committed - n, n);
+}
 
 // Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
 // persistent CUDA buffer in `sg.alloc` alive across steps. When the next
@@ -492,8 +683,10 @@ static void step_graph_free(StepGraph & sg) {
     sg.gf = nullptr;
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
+    sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.logits = nullptr;
+    sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;
     sg.topk_indices = nullptr;
     sg.delta_captures.clear();
@@ -752,9 +945,11 @@ static bool build_target_step_tree(
 static bool build_draft_step(
     StepGraph & sg,
     const DraftWeights & dw,
-    const TargetWeights & tw,   // for lm_head
+    const TargetWeights * tw,   // optional target lm_head
     ggml_backend_t backend,
-    int ctx_len) {
+    int ctx_len,
+    const DraftFeatureMirror * mirror = nullptr,
+    int committed = 0) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -772,9 +967,21 @@ static bool build_draft_step(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
-    sg.target_hidden_cat = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
+    int mirror_slot0 = 0;
+    if (mirror && draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0)) {
+        const size_t stride = mirror->target_feat->nb[1];
+        sg.target_hidden_cat = ggml_view_3d(
+            sg.ctx,
+            mirror->target_feat,
+            fc_in, ctx_len, 1,
+            stride,
+            stride * (size_t)ctx_len,
+            (size_t)mirror_slot0 * stride);
+    } else {
+        sg.target_hidden_cat = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
+        ggml_set_input(sg.target_hidden_cat);
+    }
     ggml_set_name(sg.target_hidden_cat, "target_hidden_cat");
-    ggml_set_input(sg.target_hidden_cat);
 
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, q_len);
     ggml_set_name(sg.positions, "positions_q");
@@ -792,20 +999,55 @@ static bool build_draft_step(
     gi.target_hidden_cat = sg.target_hidden_cat;
     gi.positions_q       = sg.positions;
     gi.positions_k       = sg.positions_k;
-    gi.lm_head           = tw.output;     // project through target.output (q6_K)
+    gi.lm_head           = tw ? tw->output : nullptr; // project through target.output when local
     DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
-    if (!go.logits) {
-        std::fprintf(stderr, "draft graph missing logits (lm_head was null?)\n");
+    sg.hidden_states = go.hidden_states;
+    sg.logits = go.logits;
+    if (!sg.hidden_states) {
+        std::fprintf(stderr, "draft graph missing hidden_states\n");
         return false;
     }
-    sg.logits = go.logits;
-    ggml_set_output(sg.logits);
+    if (sg.logits) {
+        // GPU-side argmax: avoids 16 CPU argmaxes over 248K vocab.
+        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+        ggml_set_name(sg.argmax_tokens, "argmax_tokens");
+        ggml_set_output(sg.argmax_tokens);
+        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    } else {
+        ggml_set_output(sg.hidden_states);
+        ggml_build_forward_expand(sg.gf, sg.hidden_states);
+    }
 
-    // GPU-side argmax: avoids 16 CPU argmaxes over 248K vocab
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "argmax_tokens");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+static bool build_lm_head_projection_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    ggml_backend_t backend,
+    int n_tokens) {
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 64 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    sg.hidden_input = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
+    ggml_set_name(sg.hidden_input, "draft_hidden_for_lm_head");
+    ggml_set_input(sg.hidden_input);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 1024, false);
+    sg.logits = ggml_mul_mat(sg.ctx, w.output, sg.hidden_input);
+    ggml_set_name(sg.logits, "draft_projected_logits");
+    ggml_set_output(sg.logits);
+    ggml_build_forward_expand(sg.gf, sg.logits);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -859,6 +1101,15 @@ int main(int argc, char ** argv) {
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  test_window_mode = false;
+    bool  draft_feature_mirror = false;
+    int   target_gpu = 0;
+    int   draft_gpu = 0;
+    if (const char * s = std::getenv("DFLASH_TARGET_GPU")) {
+        target_gpu = std::max(0, std::atoi(s));
+    }
+    if (const char * s = std::getenv("DFLASH_DRAFT_GPU")) {
+        draft_gpu = std::max(0, std::atoi(s));
+    }
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
     for (int i = 3; i < argc; i++) {
@@ -878,7 +1129,22 @@ int main(int argc, char ** argv) {
             ddtree_chain_seed = false;
         }
         else if (std::strcmp(argv[i], "--test-window") == 0)      { test_window_mode = true; }
-    else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
+        else if (std::strcmp(argv[i], "--draft-feature-mirror") == 0) {
+            draft_feature_mirror = true;
+        }
+        else if (std::strncmp(argv[i], "--target-gpu=", 13) == 0) {
+            target_gpu = std::max(0, std::atoi(argv[i] + 13));
+        }
+        else if (std::strcmp(argv[i], "--target-gpu") == 0) {
+            if (i + 1 < argc) target_gpu = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (std::strncmp(argv[i], "--draft-gpu=", 12) == 0) {
+            draft_gpu = std::max(0, std::atoi(argv[i] + 12));
+        }
+        else if (std::strcmp(argv[i], "--draft-gpu") == 0) {
+            if (i + 1 < argc) draft_gpu = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
@@ -932,15 +1198,36 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
         return 2;
     }
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
-                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window);
+                ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
+                (int)draft_feature_mirror, target_gpu, draft_gpu);
 
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
+    int cuda_device_count = 0;
+    cudaGetDeviceCount(&cuda_device_count);
+    if (target_gpu >= cuda_device_count || draft_gpu >= cuda_device_count) {
+        std::fprintf(stderr, "bad gpu ids target=%d draft=%d device_count=%d\n",
+                     target_gpu, draft_gpu, cuda_device_count);
+        return 2;
+    }
+
+    const bool split_gpus = target_gpu != draft_gpu;
+    ggml_backend_t target_backend = ggml_backend_cuda_init(target_gpu);
+    if (!target_backend) { std::fprintf(stderr, "target cuda init failed\n"); return 1; }
+    ggml_backend_t draft_backend = target_backend;
+    if (split_gpus) {
+        draft_backend = ggml_backend_cuda_init(draft_gpu);
+        if (!draft_backend) { std::fprintf(stderr, "draft cuda init failed\n"); return 1; }
+    }
+    if (split_gpus && !enable_peer_access_pair(target_gpu, draft_gpu)) {
+        std::fprintf(stderr,
+                     "warning: CUDA peer access is not fully enabled for target=%d draft=%d; split transfers may fail\n",
+                     target_gpu, draft_gpu);
+    }
+    ggml_backend_t backend = target_backend; // legacy target-side alias
 
     TargetWeights w;
-    if (!load_target_gguf(target_path, backend, w)) {
+    if (!load_target_gguf(target_path, target_backend, w)) {
         std::fprintf(stderr, "target load: %s\n", dflash27b_last_error());
         return 1;
     }
@@ -952,9 +1239,9 @@ int main(int argc, char ** argv) {
         std::string dp(draft_path);
         bool draft_ok = false;
         if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
-            draft_ok = load_draft_gguf(draft_path, backend, dw);
+            draft_ok = load_draft_gguf(draft_path, draft_backend, dw);
         } else {
-            draft_ok = load_draft_safetensors(draft_path, backend, dw);
+            draft_ok = load_draft_safetensors(draft_path, draft_backend, dw);
         }
         if (!draft_ok) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
@@ -974,7 +1261,7 @@ int main(int argc, char ** argv) {
             ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
             : DFLASH27B_DRAFT_BLOCK_SIZE);
     TargetCache cache;
-    if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache,
+    if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend, cache,
                              /*prefill_only=*/true)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return 1;
@@ -1034,7 +1321,8 @@ int main(int argc, char ** argv) {
         }
         free_target_cache(cache);
         free_target_weights(w);
-        ggml_backend_free(backend);
+        if (split_gpus) ggml_backend_free(draft_backend);
+        ggml_backend_free(target_backend);
         return 0;
     }
 
@@ -1171,7 +1459,7 @@ int main(int argc, char ** argv) {
             // Need rollback tensors for snapshot/restore
             step_graph_free(psg2);
             psg2 = StepGraph{};
-            migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache);
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
 
             snapshot_ssm_state(cache);
             std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
@@ -1194,7 +1482,7 @@ int main(int argc, char ** argv) {
 
         // Reset cache for next test
         free_target_cache(cache);
-        if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache, true)) {
+        if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend, cache, true)) {
             std::fprintf(stderr, "cache realloc failed\n"); return 1;
         }
 
@@ -1207,7 +1495,7 @@ int main(int argc, char ** argv) {
 
             step_graph_free(psg3);
             psg3 = StepGraph{};
-            migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache);
+            migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
 
             snapshot_ssm_state(cache);
             std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
@@ -1232,7 +1520,8 @@ int main(int argc, char ** argv) {
         std::printf("[test-window] === Results: %d passed, %d failed ===\n", n_pass, n_fail);
         free_target_cache(cache);
         free_target_weights(w);
-        ggml_backend_free(backend);
+        if (split_gpus) ggml_backend_free(draft_backend);
+        ggml_backend_free(target_backend);
         return n_fail > 0 ? 1 : 0;
     }
 
@@ -1246,7 +1535,13 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
     }
 
+    constexpr int PREFIX_CACHE_SLOTS = 8;
+    PrefixSnapshot prefix_snapshots[PREFIX_CACHE_SLOTS];   // default-constructed, ctx==nullptr
+
     StepGraph sg;
+    StepGraph draft_sg;
+    StepGraph proj_sg;
+    DraftFeatureMirror feature_mirror;
     bool daemon_first_iter = true;
     bool target_parked = false;
     bool draft_parked  = false;
@@ -1256,6 +1551,16 @@ int main(int argc, char ** argv) {
 
     while (true) {
         std::string prompt_file_str;
+        bool restore_from_slot        = false;
+        int  restore_slot_id          = -1;
+        bool chain_restore_requested  = false;
+        int  chain_thick_slot         = -1;
+        std::vector<int> chain_thin_ids;
+        // Inline-snap: snapshot at boundary during prefill (single snap only;
+        // multi-snap "snap=A:1,B:2" is not implemented — use separate SNAPSHOT).
+        int  snap_pos  = -1;
+        int  snap_slot = -1;
+
         if (daemon_mode) {
             std::string line;
             if (!std::getline(std::cin, line)) break;
@@ -1276,6 +1581,7 @@ int main(int argc, char ** argv) {
                     std::printf("[park] draft released\n"); std::fflush(stdout);
                 }
                 if (want_target && !target_parked) {
+                    step_graph_destroy(proj_sg);
                     free_target_weights(w);
                     target_parked = true;
                     std::printf("[park] target released\n"); std::fflush(stdout);
@@ -1292,11 +1598,11 @@ int main(int argc, char ** argv) {
                 stream_emit(-1);
                 continue;
             }
-                        if (starts_with(line, "unpark")) {
+            if (starts_with(line, "unpark")) {
                 bool want_draft  = (line == "unpark" || line == "unpark all" || line == "unpark draft");
                 bool want_target = (line == "unpark" || line == "unpark all" || line == "unpark target");
                 if (want_target && target_parked) {
-                    if (!load_target_gguf(target_path, backend, w)) {
+                    if (!load_target_gguf(target_path, target_backend, w)) {
                         std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
                         stream_emit(-1); continue;
                     }
@@ -1304,7 +1610,7 @@ int main(int argc, char ** argv) {
                     std::printf("[unpark] target restored\n"); std::fflush(stdout);
                 }
                 if (want_draft && draft_parked) {
-                    if (!load_draft_safetensors(draft_path, backend, dw)) {
+                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
                         std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                         stream_emit(-1); continue;
                     }
@@ -1346,6 +1652,7 @@ int main(int argc, char ** argv) {
                 bool restore_target = !target_parked;
                 bool restore_draft  = !draft_parked;
                 if (restore_target) {
+                    step_graph_destroy(proj_sg);
                     free_target_weights(w);
                     target_parked = true;
                     std::printf("[compress] target parked\n"); std::fflush(stdout);
@@ -1379,7 +1686,7 @@ int main(int argc, char ** argv) {
                 // Restore daemon state for the (almost certainly) following
                 // generate command.
                 if (restore_target) {
-                    if (!load_target_gguf(target_path, backend, w)) {
+                    if (!load_target_gguf(target_path, target_backend, w)) {
                         std::fprintf(stderr, "[compress] target restore: %s\n",
                                      dflash27b_last_error());
                         stream_emit(-1); continue;
@@ -1388,7 +1695,7 @@ int main(int argc, char ** argv) {
                     std::printf("[compress] target restored\n"); std::fflush(stdout);
                 }
                 if (restore_draft) {
-                    if (!load_draft_safetensors(draft_path, backend, dw)) {
+                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
                         std::fprintf(stderr, "[compress] draft restore: %s\n",
                                      dflash27b_last_error());
                         stream_emit(-1); continue;
@@ -1402,10 +1709,173 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            char ppath[1024];
-            if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
-            prompt_file_str = ppath;
-            prompt_path = prompt_file_str.c_str();
+            // ── Prefix-cache snapshot commands (#59) ──────────────────────
+            // Check longer prefixes before shorter ones to avoid mis-dispatch
+            // (SNAPSHOT_THIN must come before SNAPSHOT, RESTORE_CHAIN before RESTORE).
+            if (line.rfind("SNAPSHOT_THIN ", 0) == 0) {
+                int slot = -1, kv_start = -1, kv_end = -1;
+                if (std::sscanf(line.c_str() + 14, "%d %d %d", &slot, &kv_start, &kv_end) != 3
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
+                    std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
+                    continue;
+                }
+                if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
+                                                 prefix_snapshots[slot])) {
+                    std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
+                                 dflash27b_last_error());
+                    continue;
+                }
+                std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("SNAPSHOT ", 0) == 0) {
+                int slot = -1;
+                if (std::sscanf(line.c_str() + 9, "%d", &slot) != 1
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
+                    std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
+                    continue;
+                }
+                if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
+                    std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
+                    continue;
+                }
+                std::printf("[snap] slot=%d cur_pos=%d\n", slot, prefix_snapshots[slot].cur_pos);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("FREE_SNAPSHOT ", 0) == 0) {
+                int slot = -1;
+                if (std::sscanf(line.c_str() + 14, "%d", &slot) != 1
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) continue;
+                free_prefix_snapshot(prefix_snapshots[slot]);
+                std::printf("[snap] freed slot=%d\n", slot);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "LIST_SLOTS") {
+                std::printf("[snap] slots=");
+                bool first = true;
+                for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) {
+                    if (prefix_snapshots[i].ctx != nullptr) {
+                        std::printf("%s%d", first ? "" : ",", i);
+                        first = false;
+                    }
+                }
+                std::printf("\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("RESTORE_CHAIN ", 0) == 0) {
+                // Format: RESTORE_CHAIN <thick_slot> <thin_slot_list> <prompt_file> <n_gen>
+                // <thin_slot_list> is "0,1,2" or "-" for empty.
+                int  thick_slot_local = -2;
+                char thin_str[256]    = {0};
+                char ppath[1024]      = {0};
+                int  n_gen_local      = 0;
+                if (std::sscanf(line.c_str() + 14, "%d %255s %1023s %d",
+                                &thick_slot_local, thin_str, ppath, &n_gen_local) != 4) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad args\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                // Validate thick_slot (-1 = none).
+                if (thick_slot_local != -1
+                    && (thick_slot_local < 0 || thick_slot_local >= PREFIX_CACHE_SLOTS
+                        || prefix_snapshots[thick_slot_local].ctx == nullptr
+                        || prefix_snapshots[thick_slot_local].is_thin)) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thick slot=%d\n", thick_slot_local);
+                    stream_emit(-1);
+                    continue;
+                }
+                // Parse thin slot list. Strict: every comma-separated token
+                // must be a valid non-negative integer (rejects "1,foo,3",
+                // empty entries "1,,3", trailing junk). Codex review fix.
+                std::vector<int> thin_ids_local;
+                bool thin_parse_ok = true;
+                if (std::strcmp(thin_str, "-") != 0 && thin_str[0] != '\0') {
+                    const char * p = thin_str;
+                    while (*p && thin_parse_ok) {
+                        char * end = nullptr;
+                        long id_l = std::strtol(p, &end, 10);
+                        if (end == p) {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN malformed thin list near '%s'\n", p);
+                            thin_parse_ok = false; break;
+                        }
+                        int id = (int)id_l;
+                        if (id < 0 || id >= PREFIX_CACHE_SLOTS
+                            || prefix_snapshots[id].ctx == nullptr
+                            || !prefix_snapshots[id].is_thin) {
+                            std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thin slot=%d\n", id);
+                            thin_parse_ok = false; break;
+                        }
+                        thin_ids_local.push_back(id);
+                        if (*end == '\0') break;
+                        if (*end != ',') {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN expected ',' after slot %d, got '%c'\n",
+                                id, *end);
+                            thin_parse_ok = false; break;
+                        }
+                        p = end + 1;
+                        if (*p == '\0' || *p == ',') {
+                            std::fprintf(stderr,
+                                "[snap] RESTORE_CHAIN empty thin slot entry\n");
+                            thin_parse_ok = false; break;
+                        }
+                    }
+                }
+                if (!thin_parse_ok) {
+                    stream_emit(-1);
+                    continue;
+                }
+                n_gen                    = n_gen_local;
+                prompt_file_str          = ppath;
+                prompt_path              = prompt_file_str.c_str();
+                chain_restore_requested  = true;
+                chain_thick_slot         = thick_slot_local;
+                chain_thin_ids           = std::move(thin_ids_local);
+                // Fall through into the existing cache-rebuild + prefill path.
+            } else if (line.rfind("RESTORE ", 0) == 0) {
+                int slot = -1;
+                char ppath[1024];
+                if (std::sscanf(line.c_str() + 8, "%d %1023s %d", &slot, ppath, &n_gen) != 3
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS
+                    || prefix_snapshots[slot].ctx == nullptr) {
+                    std::fprintf(stderr, "[snap] RESTORE bad args or empty slot %d\n", slot);
+                    stream_emit(-1);
+                    continue;
+                }
+                prompt_file_str = ppath;
+                prompt_path = prompt_file_str.c_str();
+                restore_from_slot = true;
+                restore_slot_id   = slot;
+                // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
+                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
+                // Fall through into the existing prefill path; the cache reset
+                // and restore happen after the cache rebuild block below.
+            } else {
+                // Legacy: bare `<prompt_file> <n_gen>` line — full reset path.
+                char ppath[1024];
+                if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
+                prompt_file_str = ppath;
+                prompt_path = prompt_file_str.c_str();
+                // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
+                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
+            }
 
             // Reset cache state between requests. On the first request the
             // cache was promoted from prefill-only to full (with rollback
@@ -1416,6 +1886,37 @@ int main(int argc, char ** argv) {
                 reset_target_cache(cache);
             }
             daemon_first_iter = false;
+
+            // After cache is fresh, optionally restore from snapshot.
+            if (restore_from_slot) {
+                if (!restore_target_cache(prefix_snapshots[restore_slot_id], cache)) {
+                    std::fprintf(stderr, "[snap] restore failed: %s\n", dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+                std::printf("[snap] restored slot=%d cur_pos=%d\n",
+                            restore_slot_id, cache.cur_pos);
+                std::fflush(stdout);
+            }
+
+            // After cache is fresh, optionally apply chain restore.
+            if (chain_restore_requested) {
+                const PrefixSnapshot * thick_ptr =
+                    (chain_thick_slot == -1) ? nullptr : &prefix_snapshots[chain_thick_slot];
+                std::vector<const PrefixSnapshot *> thin_ptrs;
+                for (int id : chain_thin_ids) thin_ptrs.push_back(&prefix_snapshots[id]);
+                if (!restore_target_cache_chain(thick_ptr,
+                                                 thin_ptrs.empty() ? nullptr : thin_ptrs.data(),
+                                                 (int)thin_ptrs.size(),
+                                                 cache)) {
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN failed: %s\n", dflash27b_last_error());
+                    stream_emit(-1);
+                    continue;
+                }
+                std::printf("[snap] chain restored thick=%d thins=%zu cur_pos=%d\n",
+                            chain_thick_slot, thin_ptrs.size(), cache.cur_pos);
+                std::fflush(stdout);
+            }
         }
 
         auto prompt = read_int32_file(prompt_path);
@@ -1591,7 +2092,7 @@ int main(int argc, char ** argv) {
         // Promote prefill-only cache to full decode cache
         auto t_mig0 = std::chrono::steady_clock::now();
         step_graph_destroy(sg);
-        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+        if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
             std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
             return 1;
         }
@@ -1612,9 +2113,40 @@ int main(int argc, char ** argv) {
     std::vector<float>    pf_embed_buf;
     std::vector<int32_t>  pf_pos_buf;
     std::vector<float>    pf_logits_buf;
-    const int prompt_len = (int)prompt.size();
-    for (int start = 0; start < prompt_len; start += PREFILL_UBATCH) {
-        const int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
+    const int prompt_len     = (int)prompt.size();
+    const int prefill_start  = cache.cur_pos;   // 0 for fresh cache; >0 after snapshot restore
+    for (int start = prefill_start; start < prompt_len; start += PREFILL_UBATCH) {
+        int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
+
+        // Inline-snap: if snap_pos == start exactly, fire snapshot before any
+        // prefill work this iteration, then continue with the full ubatch.
+        if (snap_pos >= 0 && snap_pos == start) {
+            cache.cur_pos = start;
+            if (snap_slot >= 0) {
+                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, start);
+                    std::fflush(stdout);
+                } else {
+                    std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
+                                 snap_slot, dflash27b_last_error());
+                }
+            }
+            snap_pos = -1; snap_slot = -1;   // consume
+            // n_tokens is unchanged; continue prefilling this ubatch.
+        }
+
+        // Inline-snap: if snap_pos falls inside this ubatch, clip n_tokens to
+        // land exactly at snap_pos so the snapshot captures the right boundary.
+        bool fire_snap_after = false;
+        if (snap_pos > start && snap_pos <= start + n_tokens) {
+            n_tokens = snap_pos - start;   // land exactly at snap_pos
+            fire_snap_after = (n_tokens > 0);
+            if (n_tokens == 0) {
+                // snap_pos == start already handled above; shouldn't reach here.
+                snap_pos = -1; snap_slot = -1;
+            }
+        }
+
         const int kv_len   = start + n_tokens;
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
@@ -1661,8 +2193,36 @@ int main(int argc, char ** argv) {
                                 sizeof(float) * vocab);
         last_tok = argmax_f32(pf_logits_buf.data(), vocab);
         committed = start + n_tokens;
+
+        // Fire inline snapshot after compute, so cache boundary is exact.
+        if (fire_snap_after) {
+            cache.cur_pos  = committed;
+            cache.last_tok = last_tok;
+            if (snap_slot >= 0) {
+                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
+                    std::fflush(stdout);
+                } else {
+                    std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
+                                 snap_slot, dflash27b_last_error());
+                }
+            }
+            snap_pos = -1; snap_slot = -1;   // consume
+            // Adjust loop increment: next iteration must start at committed,
+            // not at (start + PREFILL_UBATCH). Override via start arithmetic:
+            // the for-loop does start += PREFILL_UBATCH, so back-adjust.
+            start = committed - PREFILL_UBATCH;
+        }
     }
     auto t_pf1 = std::chrono::steady_clock::now();
+    // If prefill was a no-op due to a snapshot RESTORE (cache.cur_pos already
+    // covers the prompt), seed last_tok from the restored cache so the decode
+    // loop has a valid starting token. Detected by prefill_start == prompt_len:
+    // the for loop ran zero iterations and `committed` stayed at 0.
+    if (last_tok == -1 && cache.last_tok != -1 && prefill_start == prompt_len) {
+        last_tok  = cache.last_tok;
+        committed = prompt_len;
+    }
     std::printf("[prefill] %d tokens in %.2f s, last_tok=%d\n",
                 committed,
                 std::chrono::duration<double>(t_pf1 - t_pf0).count(),
@@ -1672,7 +2232,7 @@ int main(int argc, char ** argv) {
     // Copies KV, SSM/conv state, and target_feat device→device (~1 ms).
     auto t_mig0 = std::chrono::steady_clock::now();
     step_graph_destroy(sg);
-    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, backend, cache)) {
+    if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
         std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
         return 1;
     }
@@ -1680,6 +2240,25 @@ int main(int argc, char ** argv) {
     std::printf("[migrate] %.2f ms\n",
                 std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
     } // end if (!layer_prefill)
+
+    if (draft_feature_mirror) {
+        if (!feature_mirror.target_feat || feature_mirror.cap != cache.target_feat_cap) {
+            if (!draft_feature_mirror_init(feature_mirror, draft_backend,
+                                           draft_gpu, target_gpu,
+                                           cache.target_feat_cap)) {
+                std::fprintf(stderr, "draft feature mirror init failed\n");
+                return 1;
+            }
+            std::printf("[draft-mirror] init cap=%d type=f32 device=%d target_device=%d\n",
+                        feature_mirror.cap, draft_gpu, target_gpu);
+        }
+        if (!draft_feature_mirror_sync_tail(cache, feature_mirror, committed)) {
+            std::fprintf(stderr, "draft feature mirror initial sync failed\n");
+            return 1;
+        }
+        std::printf("[draft-mirror] synced tail committed=%d cap=%d\n",
+                    committed, feature_mirror.cap);
+    }
 
     // ── DFlash decode loop
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;
@@ -1698,15 +2277,27 @@ int main(int argc, char ** argv) {
 
     // Per-phase timing accumulators (microseconds)
     double tt_draft_build = 0, tt_draft_copy_feat = 0, tt_draft_set = 0,
-           tt_draft_compute = 0, tt_draft_logits = 0,
+           tt_draft_compute = 0, tt_draft_bridge = 0, tt_draft_logits = 0,
            tt_snap = 0, tt_verify_build = 0, tt_verify_set = 0,
            tt_verify_compute = 0, tt_verify_logits = 0,
            tt_accept = 0, tt_restore = 0,
            tt_replay_build = 0, tt_replay_set = 0, tt_replay_compute = 0,
-           tt_replay_logits = 0;
+           tt_replay_logits = 0, tt_mirror_sync = 0;
     auto sync_us = [&](){
-        ggml_backend_synchronize(backend);
+        ggml_backend_synchronize(target_backend);
+        if (split_gpus) ggml_backend_synchronize(draft_backend);
         return std::chrono::steady_clock::now();
+    };
+    auto sync_draft_feature_mirror = [&](int start_pos, int n_tokens) -> bool {
+        if (!draft_feature_mirror || !feature_mirror.target_feat || n_tokens <= 0) {
+            return true;
+        }
+        auto t0 = sync_us();
+        const bool ok = draft_feature_mirror_sync_range(cache, feature_mirror,
+                                                        start_pos, n_tokens);
+        auto t1 = sync_us();
+        tt_mirror_sync += std::chrono::duration<double, std::micro>(t1 - t0).count();
+        return ok;
     };
 
     while (n_generated < n_gen) {
@@ -1728,64 +2319,109 @@ int main(int argc, char ** argv) {
         constexpr int DRAFT_CTX_MAX = 2048;
         const int draft_ctx   = std::min(committed, DRAFT_CTX_MAX);
         const int draft_start = committed - draft_ctx;
+        int mirror_slot0 = 0;
+        const bool use_mirror_view =
+            draft_feature_mirror_can_view(feature_mirror, committed, draft_ctx, mirror_slot0);
+        const bool draft_hidden_bridge = split_gpus;
 
         // 2) Draft forward
-        if (!build_draft_step(sg, dw, w, backend, /*ctx_len=*/draft_ctx)) {
+        if (!build_draft_step(draft_sg, dw, draft_hidden_bridge ? nullptr : &w,
+                              draft_backend, /*ctx_len=*/draft_ctx,
+                              use_mirror_view ? &feature_mirror : nullptr,
+                              committed)) {
             std::fprintf(stderr, "draft build failed\n"); return 1;
         }
         auto T_draft_build = sync_us();
         tt_draft_build += std::chrono::duration<double, std::micro>(T_draft_build - T0).count();
 
-        ggml_backend_tensor_set(sg.inp_embed, noise_embed_buf.data(), 0,
+        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed_buf.data(), 0,
                                 sizeof(float) * noise_embed_buf.size());
 
-        // target_hidden_cat: copy the draft-window slice of cache.target_feat
-        // (positions draft_start..committed) directly device→device.
-        // cache.target_feat is a ring of `target_feat_cap` bf16 slots, so
-        // positions map via `pos % cap`. If the draft window straddles the
-        // wrap boundary we split the bf16→f32 widen into two kernel calls.
-        const size_t fc_in    = (size_t)5 * hidden;
-        const int    cap      = cache.target_feat_cap;
-        const size_t elt_feat = ggml_element_size(cache.target_feat);
-        const int    slot0    = draft_start % cap;
-        const int    pre_n    = std::min(draft_ctx, cap - slot0);
-        const int    post_n   = draft_ctx - pre_n;
+        if (!use_mirror_view) {
+            // target_hidden_cat: copy the draft-window slice of cache.target_feat
+            // (positions draft_start..committed) directly device-to-device.
+            // cache.target_feat is a ring of `target_feat_cap` bf16 slots, so
+            // positions map via `pos % cap`. If the draft window straddles the
+            // wrap boundary we split the bf16-to-f32 widen into two kernel calls.
+            const size_t fc_in    = (size_t)5 * hidden;
+            const int    cap      = cache.target_feat_cap;
+            const size_t elt_feat = ggml_element_size(cache.target_feat);
+            const int    slot0    = draft_start % cap;
+            const int    pre_n    = std::min(draft_ctx, cap - slot0);
+            const int    post_n   = draft_ctx - pre_n;
 
-        dflash27b_launch_bf16_to_f32(
-            (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
-            sg.target_hidden_cat->data,
-            (size_t)pre_n * fc_in,
-            nullptr);
-        if (post_n > 0) {
+            cudaSetDevice(draft_gpu);
             dflash27b_launch_bf16_to_f32(
-                (const char *)cache.target_feat->data,
-                (char *)sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float),
-                (size_t)post_n * fc_in,
+                (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
+                draft_sg.target_hidden_cat->data,
+                (size_t)pre_n * fc_in,
                 nullptr);
+            if (post_n > 0) {
+                dflash27b_launch_bf16_to_f32(
+                    (const char *)cache.target_feat->data,
+                    (char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float),
+                    (size_t)post_n * fc_in,
+                    nullptr);
+            }
         }
         auto T_draft_copy = sync_us();
         tt_draft_copy_feat += std::chrono::duration<double, std::micro>(T_draft_copy - T_draft_build).count();
 
         for (int i = 0; i < q_len; i++) pos_q_buf[i] = draft_ctx + i;
         for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf[i] = i;
-        ggml_backend_tensor_set(sg.positions,   pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
-        ggml_backend_tensor_set(sg.positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
+        ggml_backend_tensor_set(draft_sg.positions,   pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
+        ggml_backend_tensor_set(draft_sg.positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
         auto T_draft_set = sync_us();
         tt_draft_set += std::chrono::duration<double, std::micro>(T_draft_set - T_draft_copy).count();
 
-        auto st = ggml_backend_graph_compute(backend, sg.gf);
+        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
         if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "draft compute %d\n", (int)st); return 1; }
         auto T_draft_compute = sync_us();
         tt_draft_compute += std::chrono::duration<double, std::micro>(T_draft_compute - T_draft_set).count();
+
+        if (draft_hidden_bridge) {
+            if (!proj_sg.gf || !proj_sg.hidden_input ||
+                proj_sg.hidden_input->ne[1] != q_len) {
+                if (!build_lm_head_projection_step(proj_sg, w, target_backend, q_len)) {
+                    std::fprintf(stderr, "draft lm-head projection build failed\n");
+                    return 1;
+                }
+            }
+            if (!proj_sg.hidden_input || !proj_sg.logits) {
+                std::fprintf(stderr, "draft lm-head projection build failed\n");
+                return 1;
+            }
+            const size_t hidden_bytes = ggml_nbytes(draft_sg.hidden_states);
+            if (!copy_peer_async(proj_sg.hidden_input->data, target_gpu,
+                                 draft_sg.hidden_states->data, draft_gpu,
+                                 hidden_bytes)) {
+                std::fprintf(stderr, "draft hidden peer copy failed\n");
+                return 1;
+            }
+            cudaSetDevice(target_gpu);
+            cudaDeviceSynchronize();
+            auto st_proj = ggml_backend_graph_compute(target_backend, proj_sg.gf);
+            if (st_proj != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "draft lm-head projection compute %d\n", (int)st_proj);
+                return 1;
+            }
+            ggml_backend_tensor_get(proj_sg.logits, draft_logits_buf.data(), 0,
+                                    sizeof(float) * vocab * q_len);
+        }
+        auto T_draft_bridge = sync_us();
+        tt_draft_bridge += std::chrono::duration<double, std::micro>(T_draft_bridge - T_draft_compute).count();
 
         // DDTree top-K: use GPU argmax for draft_tok; full logits transfer
         // only when DDTree needs top-K (K>1) for sibling expansion.
         const int ddtree_K = (ddtree_budget > q_len - 1) ? 8 : 1;
 
-        // Always use GPU argmax for draft_tok (saves CPU argmax over 248K vocab)
-        {
+        if (draft_hidden_bridge) {
+            for (int i = 0; i < q_len; i++) {
+                draft_tok[i] = argmax_f32(draft_logits_buf.data() + (size_t)i * vocab, vocab);
+            }
+        } else {
             std::vector<int32_t> gpu_argmax(q_len);
-            ggml_backend_tensor_get(sg.argmax_tokens, gpu_argmax.data(), 0,
+            ggml_backend_tensor_get(draft_sg.argmax_tokens, gpu_argmax.data(), 0,
                                     sizeof(int32_t) * q_len);
             for (int i = 0; i < q_len; i++) draft_tok[i] = gpu_argmax[i];
         }
@@ -1820,8 +2456,10 @@ int main(int argc, char ** argv) {
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
                 // Transfer full logits for positions 1..q_len-1.
-                ggml_backend_tensor_get(sg.logits, draft_logits_buf.data(), 0,
-                                        sizeof(float) * vocab * q_len);
+                if (!draft_hidden_bridge) {
+                    ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                            sizeof(float) * vocab * q_len);
+                }
                 extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
                                    L, vocab, ddtree_K,
                                    ddtree_top_log_probs.data(),
@@ -1830,7 +2468,7 @@ int main(int argc, char ** argv) {
             }
         }
         auto T_draft_logits = sync_us();
-        tt_draft_logits += std::chrono::duration<double, std::micro>(T_draft_logits - T_draft_compute).count();
+        tt_draft_logits += std::chrono::duration<double, std::micro>(T_draft_logits - T_draft_bridge).count();
 
         // 3) Snapshot SSM state (skipped in fast_rollback mode: the patched
         //    gated_delta_net kernel captures per-step intermediate states, so
@@ -2174,6 +2812,11 @@ int main(int argc, char ** argv) {
                 // (graph build, embed) can overlap with the GPU compaction.
             }
 
+            if (!sync_draft_feature_mirror(committed, commit_n)) {
+                std::fprintf(stderr, "draft feature mirror sync failed after ddtree commit\n");
+                return 1;
+            }
+
             committed    += commit_n;
             n_generated  += commit_n;
             n_accept_sum += commit_n;  // for stats
@@ -2489,6 +3132,11 @@ int main(int argc, char ** argv) {
             if (hit_eos) break;
         }
 
+        if (!sync_draft_feature_mirror(committed, commit_n)) {
+            std::fprintf(stderr, "draft feature mirror sync failed after commit\n");
+            return 1;
+        }
+
         committed    += commit_n;
         n_generated  += commit_n;
         n_accept_sum += accept_n;
@@ -2505,6 +3153,7 @@ int main(int argc, char ** argv) {
     std::printf("  draft_copyfeat %.2f\n", avg_ms(tt_draft_copy_feat));
     std::printf("  draft_set      %.2f\n", avg_ms(tt_draft_set));
     std::printf("  draft_compute  %.2f\n", avg_ms(tt_draft_compute));
+    std::printf("  draft_bridge   %.2f\n", avg_ms(tt_draft_bridge));
     std::printf("  draft_logits   %.2f\n", avg_ms(tt_draft_logits));
     std::printf("  snapshot_ssm   %.2f\n", avg_ms(tt_snap));
     std::printf("  verify_build   %.2f\n", avg_ms(tt_verify_build));
@@ -2517,9 +3166,12 @@ int main(int argc, char ** argv) {
     std::printf("  replay_set     %.2f\n", avg_ms(tt_replay_set));
     std::printf("  replay_compute %.2f\n", avg_ms(tt_replay_compute));
     std::printf("  replay_logits  %.2f\n", avg_ms(tt_replay_logits));
+    std::printf("  mirror_sync    %.2f\n", avg_ms(tt_mirror_sync));
     double sum_ms = avg_ms(tt_draft_build + tt_draft_copy_feat + tt_draft_set + tt_draft_compute + tt_draft_logits
+                           + tt_draft_bridge
                            + tt_snap + tt_verify_build + tt_verify_set + tt_verify_compute + tt_verify_logits
-                           + tt_accept + tt_restore + tt_replay_build + tt_replay_set + tt_replay_compute + tt_replay_logits);
+                           + tt_accept + tt_restore + tt_replay_build + tt_replay_set + tt_replay_compute + tt_replay_logits
+                           + tt_mirror_sync);
     std::printf("  ----- sum     %.2f\n", sum_ms);
 
     std::printf("\n[dflash] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
@@ -2535,6 +3187,13 @@ int main(int argc, char ** argv) {
     std::printf("\n");
 
     if (daemon_mode) {
+        // Update cache.cur_pos / cache.last_tok to reflect end-of-generation
+        // state so a subsequent SNAPSHOT command captures the correct boundary.
+        // Both fields are otherwise unused by the prefill/decode hot path
+        // (kv_start is tracked separately, last_tok is a local) — they exist
+        // for cross-request snapshot accounting.
+        cache.cur_pos  = (int)out_all.size();
+        cache.last_tok = last_tok;
         stream_emit(-1);
     } else {
         if (out_path) write_int32_file(out_path, out_all);
@@ -2543,10 +3202,17 @@ int main(int argc, char ** argv) {
 
     } // end while(true)
 
+    draft_feature_mirror_free(feature_mirror);
+    step_graph_destroy(proj_sg);
+    step_graph_destroy(draft_sg);
+    if (daemon_mode) {
+        for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) free_prefix_snapshot(prefix_snapshots[i]);
+    }
     step_graph_destroy(sg);
     free_target_cache(cache);
     free_draft_weights(dw);
     free_target_weights(w);
-    ggml_backend_free(backend);
+    if (split_gpus) ggml_backend_free(draft_backend);
+    ggml_backend_free(target_backend);
     return 0;
 }

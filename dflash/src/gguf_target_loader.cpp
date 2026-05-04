@@ -233,13 +233,13 @@ bool load_target_gguf(const std::string & path,
     const uint32_t ssm_dt    = get_u32_or(gctx, "qwen35.ssm.time_step_rank",0);
     const uint32_t ssm_grp   = get_u32_or(gctx, "qwen35.ssm.group_count",  0);
 
-    if (n_embd != 5120 || n_layer != 64 || n_head != 24 || n_headkv != 4 ||
-        kl != 256 || vl != 256 || n_ff != 17408 || fai != 4 ||
-        ssm_conv != 4 || ssm_inner != 6144 || ssm_state != 128 ||
-        ssm_dt != 48 || ssm_grp != 16) {
+    if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
+        kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
+        ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
+        ssm_dt == 0 || ssm_grp == 0) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "unexpected hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "missing or zero hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
             n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
             ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
@@ -248,16 +248,65 @@ bool load_target_gguf(const std::string & path,
         return false;
     }
 
+    // Structural invariants required by the graph builder.
+    if (kl != vl) {
+        set_last_error("key_length != value_length not supported");
+        gguf_free(gctx); return false;
+    }
+    if (ssm_inner % ssm_dt != 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "ssm.inner_size=%u not divisible by ssm.time_step_rank=%u", ssm_inner, ssm_dt);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
+    if (n_layer % fai != 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
+
     // rope dimension_sections (array of 4 uint32)
     int rope_sections[4] = {0, 0, 0, 0};
     {
         int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
-        if (rid >= 0) {
-            size_t n = gguf_get_arr_n(gctx, rid);
-            if (n >= 4) {
-                const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
-                for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
+        if (rid < 0) {
+            set_last_error("missing qwen35.rope.dimension_sections");
+            gguf_free(gctx); return false;
+        }
+        size_t n = gguf_get_arr_n(gctx, rid);
+        if (n < 4) {
+            set_last_error("qwen35.rope.dimension_sections has < 4 entries");
+            gguf_free(gctx); return false;
+        }
+        const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
+        for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
+    }
+
+    // Validate rope_sections against head_dim. n_rot = 2 * sum(sections) is
+    // the number of dims rotated by ggml_rope_multi; it must be even, > 0,
+    // and ≤ head_dim, otherwise rope reads/writes out of bounds.
+    {
+        long sum = 0;
+        for (int k = 0; k < 4; k++) {
+            if (rope_sections[k] < 0) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                    "rope_sections[%d]=%d is negative", k, rope_sections[k]);
+                set_last_error(buf);
+                gguf_free(gctx); return false;
             }
+            sum += rope_sections[k];
+        }
+        const long n_rot = 2 * sum;
+        if (n_rot <= 0 || n_rot > (long)kl) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                "rope_sections {%d,%d,%d,%d} → n_rot=%ld invalid for head_dim=%u",
+                rope_sections[0], rope_sections[1], rope_sections[2], rope_sections[3],
+                n_rot, kl);
+            set_last_error(buf);
+            gguf_free(gctx); return false;
         }
     }
 
@@ -277,6 +326,15 @@ bool load_target_gguf(const std::string & path,
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
+
+    // Compute capture layer IDs: evenly spaced through the target layers.
+    // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
+    {
+        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        const int step = ((int)n_layer - 2) / (N - 1);
+        for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
+    }
+
     out.layers.assign((size_t)n_layer, TargetLayer{});
 
     // ── 2. Wire our layer pointers to tensors inside meta_ctx ─────────

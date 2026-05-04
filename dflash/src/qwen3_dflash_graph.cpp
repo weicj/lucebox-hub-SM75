@@ -43,9 +43,9 @@ DraftGraphOutputs build_draft_graph(
     const int q_len    = DFLASH27B_DRAFT_BLOCK_SIZE;
     const int ctx_len  = in.ctx_len;
     const int total_k  = ctx_len + q_len;
-    const int n_head   = DFLASH27B_TARGET_N_HEADS;           // 32
-    const int n_kv     = DFLASH27B_TARGET_N_KV_HEADS;        // 8
-    const int head_dim = DFLASH27B_TARGET_HEAD_DIM;          // 128
+    const int n_head   = w.n_head;
+    const int n_kv     = w.n_head_kv;
+    const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
     const float rope_base = DFLASH27B_ROPE_THETA;
     (void)ctx_len;  // used only via input tensor shapes
@@ -62,7 +62,7 @@ DraftGraphOutputs build_draft_graph(
     // ── 2. Decoder layers
     ggml_tensor * h = in.noise_embed;  // [hidden, q_len, 1]
 
-    for (int il = 0; il < DFLASH27B_DRAFT_LAYERS; il++) {
+    for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
 
         // ── 2a. Attention pre-norm

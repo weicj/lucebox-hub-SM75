@@ -140,33 +140,71 @@ bool load_draft_gguf(const std::string & path,
         }
     }
 
-    // Validate dimensions that the graph builder hardcodes
+    // Read dimensions from GGUF metadata
     const char * A = "qwen35-dflash-draft";
     char key[128];
 
-    auto check_u32 = [&](const char * suffix, uint32_t expected) -> bool {
+    auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
         std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
-        uint32_t v = get_u32_or(gctx, key, 0);
-        if (v != expected) {
-            char b[256];
-            std::snprintf(b, sizeof(b), "draft GGUF: %s=%u expected %u", key, v, expected);
-            set_last_error(b);
-            return false;
-        }
-        return true;
+        return get_u32_or(gctx, key, fallback);
     };
 
-    bool ok = true;
-    ok = ok && check_u32("embedding_length",        DFLASH27B_TARGET_HIDDEN);
-    ok = ok && check_u32("block_count",             DFLASH27B_DRAFT_LAYERS);
-    ok = ok && check_u32("feed_forward_length",     DFLASH27B_TARGET_INTERMEDIATE);
-    ok = ok && check_u32("attention.head_count",    DFLASH27B_TARGET_N_HEADS);
-    ok = ok && check_u32("attention.head_count_kv", DFLASH27B_TARGET_N_KV_HEADS);
-    ok = ok && check_u32("attention.key_length",    DFLASH27B_TARGET_HEAD_DIM);
-    ok = ok && check_u32("attention.value_length",  DFLASH27B_TARGET_HEAD_DIM);
-    ok = ok && check_u32("dflash.block_size",       DFLASH27B_DRAFT_BLOCK_SIZE);
-    ok = ok && check_u32("dflash.n_target_layers",  DFLASH27B_DRAFT_N_TARGET_LAYERS);
-    if (!ok) {
+    const uint32_t n_embd    = read_u32("embedding_length",        0);
+    const uint32_t n_layer   = read_u32("block_count",             0);
+    const uint32_t n_ff      = read_u32("feed_forward_length",     0);
+    const uint32_t n_head    = read_u32("attention.head_count",    0);
+    const uint32_t n_head_kv = read_u32("attention.head_count_kv", 0);
+    const uint32_t head_dim  = read_u32("attention.key_length",    0);
+    const uint32_t block_sz  = read_u32("dflash.block_size",       0);
+    const uint32_t n_tgt_lay = read_u32("dflash.n_target_layers",  0);
+
+    if (n_embd == 0 || n_layer == 0 || n_ff == 0 || n_head == 0 ||
+        n_head_kv == 0 || head_dim == 0) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "draft GGUF: missing hparams: n_embd=%u n_layer=%u n_ff=%u "
+            "n_head=%u n_head_kv=%u head_dim=%u",
+            n_embd, n_layer, n_ff, n_head, n_head_kv, head_dim);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // The draft graph builder still hardcodes block_size and the number of
+    // captured target layers (drives fc weight shape and capture_layer_ids
+    // array length). Reject GGUFs whose metadata disagrees with the compiled
+    // constants, otherwise we would silently mis-shape the graph.
+    if (block_sz != (uint32_t)DFLASH27B_DRAFT_BLOCK_SIZE ||
+        n_tgt_lay != (uint32_t)DFLASH27B_DRAFT_N_TARGET_LAYERS) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "draft GGUF: dflash.block_size=%u (expected %d), "
+            "dflash.n_target_layers=%u (expected %d)",
+            block_sz, DFLASH27B_DRAFT_BLOCK_SIZE,
+            n_tgt_lay, DFLASH27B_DRAFT_N_TARGET_LAYERS);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
+    // would otherwise trigger huge allocations or signed-int overflow when
+    // narrowed below. Limits chosen well above any plausible LLM config.
+    constexpr uint32_t MAX_LAYERS  = 1024;
+    constexpr uint32_t MAX_EMBD    = 1u << 17;   // 131072
+    constexpr uint32_t MAX_FF      = 1u << 19;   // 524288
+    constexpr uint32_t MAX_HEADS   = 1024;
+    constexpr uint32_t MAX_HEADDIM = 1024;
+    if (n_layer   > MAX_LAYERS  || n_embd    > MAX_EMBD  ||
+        n_ff      > MAX_FF      || n_head    > MAX_HEADS ||
+        n_head_kv > MAX_HEADS   || head_dim  > MAX_HEADDIM ||
+        n_head_kv > n_head      || (n_head % n_head_kv) != 0) {
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+            "draft GGUF: hparams out of range: n_embd=%u n_layer=%u n_ff=%u "
+            "n_head=%u n_head_kv=%u head_dim=%u",
+            n_embd, n_layer, n_ff, n_head, n_head_kv, head_dim);
+        set_last_error(buf);
         gguf_free(gctx);
         return false;
     }
@@ -174,7 +212,13 @@ bool load_draft_gguf(const std::string & path,
     // ── 2. Wire tensor pointers into DraftWeights ────────────────────────
     out.ctx     = meta_ctx;
     out.backend = backend;
-    out.layers.assign(DFLASH27B_DRAFT_LAYERS, DraftLayer{});
+    out.n_layer   = (int)n_layer;
+    out.n_head    = (int)n_head;
+    out.n_head_kv = (int)n_head_kv;
+    out.head_dim  = (int)head_dim;
+    out.n_embd    = (int)n_embd;
+    out.n_ff      = (int)n_ff;
+    out.layers.assign((size_t)n_layer, DraftLayer{});
 
     auto g = [&](const char * name) -> ggml_tensor * {
         return ggml_get_tensor(meta_ctx, name);
@@ -190,7 +234,7 @@ bool load_draft_gguf(const std::string & path,
         return false;
     }
 
-    for (int il = 0; il < DFLASH27B_DRAFT_LAYERS; il++) {
+    for (int il = 0; il < out.n_layer; il++) {
         char name[128];
         auto fnd = [&](const char * suffix) -> ggml_tensor * {
             std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);

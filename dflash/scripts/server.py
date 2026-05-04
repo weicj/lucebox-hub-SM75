@@ -4,16 +4,14 @@ OpenAI-compatible HTTP server on top of test_dflash.
     pip install fastapi uvicorn transformers
     python3 scripts/server.py                 # serves on :8000
 
-    curl http://localhost:8000/v1/chat/completions \\
-        -H 'Content-Type: application/json' \\
+    curl http://localhost:8000/v1/chat/completions \
+        -H 'Content-Type: application/json' \
         -d '{"model":"luce-dflash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 Drop-in for Open WebUI / LM Studio / Cline by setting
   OPENAI_API_BASE=http://localhost:8000/v1  OPENAI_API_KEY=sk-any
 
 Streams tokens as Server-Sent Events using the OpenAI delta format.
-Model reloads per request (~10 s first-token latency). A daemon-mode
-binary that keeps the model resident is a planned follow-up.
 """
 import argparse
 import json
@@ -28,6 +26,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware          # FIX 1: add CORS
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
@@ -37,6 +36,7 @@ from _prefill_hook import (
     PrefillConfig, add_cli_flags, config_from_args,
     compress_text_via_daemon,
 )
+from prefix_cache import DaemonStdoutBus, PrefixCache
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,8 +56,6 @@ def resolve_draft(root: Path) -> Path:
     raise FileNotFoundError(f"no model.safetensors under {root}")
 
 
-# Models known to share the qwen35 GGUF arch + vocab. Verified via
-# tokenizer.ggml.pre == "qwen35" and identical eos/pad/bos token IDs.
 _QWEN35_FAMILY_TOKENIZERS = {
     "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
     "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
@@ -65,14 +63,6 @@ _QWEN35_FAMILY_TOKENIZERS = {
 
 
 def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
-    """Infer the HuggingFace tokenizer repo from a GGUF target file.
-
-    The GGUF file encodes its own tokenizer so in principle we could use that
-    directly, but `test_dflash` drives generation through the HF tokenizer for
-    chat-template application. We match on `general.basename` / `general.name`
-    metadata; if anything goes wrong we fall back to the historical default
-    (Qwen/Qwen3.5-27B) so existing setups don't break.
-    """
     default = "Qwen/Qwen3.5-27B"
     try:
         from gguf import GGUFReader  # type: ignore
@@ -97,8 +87,22 @@ def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
     return default
 
 
+# FIX 2: _content_to_str helper used for BOTH OpenAI and Anthropic message
+# content fields (str | list[dict]). Previously OpenAI list[dict] content
+# was passed raw to the tokenizer and caused a crash.
+def _content_to_str(content: "str | list[dict]") -> str:
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
 class ChatMessage(BaseModel):
     role: str
+    # FIX 2 cont: accept list[dict] in the model but always stringify it
     content: str | list[dict]
 
 
@@ -107,13 +111,14 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
-    temperature: float | None = None  # noted + ignored (greedy-only)
-    top_p: float | None = None
+    temperature: float | None = None   # accepted, ignored (greedy-only)
+    top_p: float | None = None         # accepted, ignored
+    top_k: int | None = None           # accepted, ignored
+    stop: list[str] | str | None = None  # FIX 3: accept stop field (Open WebUI sends it)
 
 
 class AnthropicMessage(BaseModel):
     role: str
-    # Anthropic allows either a plain string or a list of content blocks.
     content: str | list[dict]
 
 
@@ -131,9 +136,22 @@ class AnthropicMessagesRequest(BaseModel):
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
               tokenizer: AutoTokenizer, stop_ids: set[int],
               prefill_cfg: PrefillConfig | None = None,
-              drafter_tokenizer: AutoTokenizer | None = None) -> FastAPI:
+              drafter_tokenizer: AutoTokenizer | None = None,
+              prefix_cache_slots: int = 4,
+              prefill_cache_slots: int = 4) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
+
+    # FIX 1: CORS middleware so Open WebUI / browser frontends on other ports
+    # can reach this server without being blocked by the browser.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     daemon_lock = asyncio.Lock()
 
     r_pipe, w_pipe = os.pipe()
@@ -156,21 +174,72 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
            f"--stream-fd={stream_fd_val}"]
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
-                                       stdin=subprocess.PIPE)
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
     else:
         daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
-                                       stdin=subprocess.PIPE)
+                                       stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, bufsize=0)
     os.close(w_pipe)
 
+    bus = DaemonStdoutBus(daemon_proc.stdout)
+
+    def _resolve_kv_k_type():
+        kv = "q8_0"
+        if os.environ.get("DFLASH27B_KV_F16", "0") != "0":
+            kv = "f16"
+        if os.environ.get("DFLASH27B_KV_Q4", "0") != "0":
+            kv = "q4_0"
+        if os.environ.get("DFLASH27B_KV_TQ3", "0") != "0":
+            kv = "tq3_0"
+        if os.environ.get("DFLASH27B_KV_K"):
+            kv = os.environ["DFLASH27B_KV_K"].lower()
+        return kv
+
+    _fa_window = int(os.environ.get("DFLASH27B_FA_WINDOW", 2048))
+    prefix_cache = PrefixCache(
+        daemon_stdin=daemon_proc.stdin,
+        await_reply=bus.await_reply,
+        daemon_lock=daemon_lock,
+        tokenizer=tokenizer,
+        kv_k_type=_resolve_kv_k_type(),
+        fa_window=_fa_window,
+        cap=prefix_cache_slots,
+    )
+    if prefill_cfg is not None and prefill_cache_slots > 0:
+        prefix_cache.init_full_cache(prefill_cache_slots)
+
+    @app.on_event("startup")
+    async def _startup():
+        bus.start(asyncio.get_running_loop())
+        await prefix_cache.startup_sync()
+
+    # FIX 4: /health endpoint — Open WebUI and many clients ping this before
+    # sending requests. Without it they show a permanent "disconnected" badge.
+    @app.get("/health")
+    def health():
+        alive = daemon_proc.poll() is None
+        if not alive:
+            return JSONResponse({"status": "error", "detail": "daemon exited"}, status_code=503)
+        return {"status": "ok"}
+
+    # FIX 5: richer /v1/models response — Open WebUI uses `context_length` and
+    # `created` to populate the model picker and context-bar correctly.
     @app.get("/v1/models")
     def list_models():
         return {
             "object": "list",
-            "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "luce"}],
+            "data": [{
+                "id": MODEL_NAME,
+                "object": "model",
+                "owned_by": "luce",
+                "created": 1700000000,
+                "context_length": max_ctx,          # shown in Open WebUI header
+                "max_context_length": max_ctx,
+            }],
         }
 
     def _ids_to_bin(ids: list[int]) -> Path:
-        # mkstemp returns (fd, path). os.fdopen() takes ownership and closes.
         fd, path = tempfile.mkstemp(suffix=".bin")
         with os.fdopen(fd, "wb") as f:
             for t in ids:
@@ -178,30 +247,20 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         return Path(path)
 
     def _render_messages(msgs_list: list[dict]) -> tuple[Path, list[int], str]:
-        """Apply chat template to msgs_list and return (bin path, ids, raw prompt).
-
-        The raw prompt is returned for spec-prefill: when compression fires we
-        re-tokenise it with the drafter vocab.
-        """
         prompt = tokenizer.apply_chat_template(
             msgs_list, tokenize=False, add_generation_prompt=True)
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         return _ids_to_bin(ids), ids, prompt
 
+    # FIX 2 applied: always call _content_to_str on message content
     def _tokenize_prompt(req: ChatRequest) -> tuple[Path, list[int], list[dict]]:
-        """Returns (bin path, ids, raw msgs). Does NOT yet apply prefill compression."""
-        msgs = [{"role": m.role, "content": _anthropic_text_from_content(m.content)
-                 if isinstance(m.content, list) else m.content}
+        msgs = [{"role": m.role, "content": _content_to_str(m.content)}
                 for m in req.messages]
         path, ids, _prompt = _render_messages(msgs)
         return path, ids, msgs
 
     def _maybe_compress(msgs: list[dict], prompt_bin: Path, prompt_ids: list[int]
                         ) -> tuple[Path, list[int]]:
-        """Run pflash compression on the LAST user message if config + length
-        thresholds say so. Returns the (possibly new) bin path + ids. Holds the
-        daemon lock for the duration via the *outer* caller (callers call this
-        from within ``async with daemon_lock``)."""
         if not prefill_cfg or not prefill_cfg.enabled:
             return prompt_bin, prompt_ids
         if not prefill_cfg.should_compress(len(prompt_ids)):
@@ -209,7 +268,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         if drafter_tokenizer is None:
             return prompt_bin, prompt_ids
 
-        # Find the last user message (the long-context blob)
         last_user_idx = next((i for i in range(len(msgs) - 1, -1, -1)
                               if msgs[i]["role"] == "user"), None)
         if last_user_idx is None:
@@ -227,8 +285,10 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         new_msgs = list(msgs)
         new_msgs[last_user_idx] = {"role": "user", "content": compressed_text}
         new_bin, new_ids, _ = _render_messages(new_msgs)
-        try: prompt_bin.unlink()
-        except Exception: pass
+        try:
+            prompt_bin.unlink()
+        except Exception:
+            pass
         return new_bin, new_ids
 
     def _token_stream(r, n_gen):
@@ -251,90 +311,240 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             if generated >= n_gen:
                 hit_stop = True
 
+    # FIX 6: _collect_tokens_sync — non-streaming paths previously called
+    # list(_token_stream(...)) directly (blocking the event loop) or used
+    # an async comprehension over _astream_tokens inside daemon_lock
+    # (risking a deadlock if the threadpool stalled). Using run_in_executor
+    # offloads the blocking os.read loop to a thread without holding any
+    # asyncio primitive across the thread boundary.
+    async def _collect_tokens_sync(r, n_gen) -> list[int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: list(_token_stream(r, n_gen)))
+
+    async def _astream_tokens(r, n_gen):
+        generated = 0
+        hit_stop = False
+        loop = asyncio.get_running_loop()
+        while True:
+            b = await loop.run_in_executor(None, os.read, r, 4)
+            if not b or len(b) < 4:
+                break
+            tok_id = struct.unpack("<i", b)[0]
+            if tok_id == -1:
+                break
+            if hit_stop:
+                continue
+            if tok_id in stop_ids:
+                hit_stop = True
+                continue
+            generated += 1
+            yield tok_id
+            if generated >= n_gen:
+                hit_stop = True
+
+    # FIX 7: _write_cmd helper — centralises stdin write+flush and guards
+    # against a dead daemon so callers get a clean 503 instead of a hang.
+    def _write_cmd(cmd_line: str):
+        if daemon_proc.poll() is not None:
+            raise RuntimeError("dflash daemon has exited unexpectedly")
+        daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+        daemon_proc.stdin.flush()
+
+    def _build_cmd_line(cur_bin, cur_ids, gen_len, prefix_cache,
+                        prompt_ids, full_snap_prep_ref: list,
+                        compression_fired: bool):
+        """
+        FIX 8: extracted cmd_line construction so both streaming and
+        non-streaming paths share identical logic and can't diverge.
+        Returns (cmd_line, snap_prep).
+        full_snap_prep_ref is a 1-element list used as an out-param.
+        """
+        if compression_fired:
+            full_snap_prep = prefix_cache.prepare_full_snap(prompt_ids)
+            full_snap_prep_ref[0] = full_snap_prep
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None
+            else:
+                return f"{cur_bin} {gen_len}\n", None
+        else:
+            full_snap_prep_ref[0] = None
+            hit = prefix_cache.lookup(cur_ids)
+            snap_prep = prefix_cache.prepare_inline_snap(cur_ids)
+            if hit:
+                slot, _prefix_len = hit
+                cmd_line = f"RESTORE {slot} {cur_bin} {gen_len}"
+            else:
+                cmd_line = f"{cur_bin} {gen_len}"
+            if snap_prep:
+                cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
+            return cmd_line + "\n", snap_prep
+
+    def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
+        return min(max_tokens, max_ctx - prompt_len - 20)
+
+    # ── /v1/chat/completions ────────────────────────────────────────────────
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
         prompt_bin, prompt_ids, raw_msgs = _tokenize_prompt(req)
-
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
-
-        def _gen_len_for(prompt_len: int) -> int:
-            return min(req.max_tokens, max_ctx - prompt_len - 20)
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
                 async with daemon_lock:
-                    cur_bin, cur_ids = await asyncio.to_thread(
-                        _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
-                    prompt_len = len(cur_ids)
-                    gen_len = _gen_len_for(prompt_len)
-                    if gen_len <= 0:
-                        try: cur_bin.unlink()
-                        except Exception: pass
-                        err = {"id": completion_id, "object": "chat.completion.chunk",
-                               "created": created, "model": MODEL_NAME,
-                               "choices": [{"index": 0, "delta": {},
-                                            "finish_reason": "length"}]}
-                        yield f"data: {json.dumps(err)}\n\n"
+                    full_snap_prep_ref = [None]
+                    snap_prep = None
+
+                    full_hit = prefix_cache.lookup_full(prompt_ids)
+                    if full_hit is not None:
+                        slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                        cur_bin = Path(cached_cur_bin)
+                        prompt_len = cached_cur_ids_len
+                        gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                        if gen_len <= 0:
+                            try: prompt_bin.unlink()
+                            except Exception: pass
+                            err = {"id": completion_id, "object": "chat.completion.chunk",
+                                   "created": created, "model": MODEL_NAME,
+                                   "choices": [{"index": 0, "delta": {},
+                                                "finish_reason": "length"}]}
+                            yield f"data: {json.dumps(err)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                    else:
+                        cur_bin, cur_ids = await asyncio.to_thread(
+                            _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
+                        prompt_len = len(cur_ids)
+                        gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                        if gen_len <= 0:
+                            try: cur_bin.unlink()
+                            except Exception: pass
+                            err = {"id": completion_id, "object": "chat.completion.chunk",
+                                   "created": created, "model": MODEL_NAME,
+                                   "choices": [{"index": 0, "delta": {},
+                                                "finish_reason": "length"}]}
+                            yield f"data: {json.dumps(err)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        compression_fired = (cur_bin != prompt_bin)
+                        cmd_line, snap_prep = _build_cmd_line(
+                            cur_bin, cur_ids, gen_len, prefix_cache,
+                            prompt_ids, full_snap_prep_ref, compression_fired)
+
+                    # FIX 7: guard against dead daemon
+                    try:
+                        _write_cmd(cmd_line)
+                    except RuntimeError as e:
+                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    cmd_line = f"{cur_bin} {gen_len}\n"
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+
                     head = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": MODEL_NAME,
                         "choices": [{"index": 0,
-                                      "delta": {"role": "assistant"},
-                                      "finish_reason": None}],
+                                     "delta": {"role": "assistant"},
+                                     "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(head)}\n\n"
+
                     try:
-                        # Offload blocking os.read in _token_stream to a thread so
-                        # SSE chunks flush progressively instead of after generation ends.
-                        async for tok_id in iterate_in_threadpool(_token_stream(r_pipe, gen_len)):
+                        async for tok_id in _astream_tokens(r_pipe, gen_len):
                             chunk = {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": created, "model": MODEL_NAME,
                                 "choices": [{"index": 0,
-                                              "delta": {"content": tokenizer.decode([tok_id])},
-                                              "finish_reason": None}],
+                                             "delta": {"content": tokenizer.decode([tok_id])},
+                                             "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
                     finally:
-                        try: cur_bin.unlink()
-                        except Exception: pass
+                        if full_hit is None:
+                            try: cur_bin.unlink()
+                            except Exception: pass
+                        else:
+                            try: prompt_bin.unlink()
+                            except Exception: pass
+
+                    full_snap_prep = full_snap_prep_ref[0]
+                    if full_snap_prep is not None:
+                        fslot, _ = full_snap_prep
+                        prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+                    elif snap_prep:
+                        prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+
                     tail = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": MODEL_NAME,
                         "choices": [{"index": 0, "delta": {},
-                                      "finish_reason": "stop"}],
+                                     "finish_reason": "stop"}],
                     }
                     yield f"data: {json.dumps(tail)}\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        # Non-streaming: collect all tokens, return one response
+        # Non-streaming
         async with daemon_lock:
-            cur_bin, cur_ids = await asyncio.to_thread(
-                _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
-            prompt_len = len(cur_ids)
-            gen_len = _gen_len_for(prompt_len)
-            if gen_len <= 0:
-                try: cur_bin.unlink()
-                except Exception: pass
-                return JSONResponse(
-                    {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
-                    status_code=400)
-            cmd_line = f"{cur_bin} {gen_len}\n"
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
-            tokens = list(_token_stream(r_pipe, gen_len))
+            full_snap_prep_ref = [None]
+            snap_prep = None
 
-        try: cur_bin.unlink()
-        except Exception: pass
+            full_hit = prefix_cache.lookup_full(prompt_ids)
+            if full_hit is not None:
+                slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                cur_bin = Path(cached_cur_bin)
+                cur_ids = None
+                prompt_len = cached_cur_ids_len
+                gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                if gen_len <= 0:
+                    try: prompt_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse(
+                        {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
+                        status_code=400)
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+            else:
+                cur_bin, cur_ids = await asyncio.to_thread(
+                    _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
+                prompt_len = len(cur_ids)
+                gen_len = _gen_len_for(prompt_len, req.max_tokens)
+                if gen_len <= 0:
+                    try: cur_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse(
+                        {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
+                        status_code=400)
+                compression_fired = (cur_bin != prompt_bin)
+                cmd_line, snap_prep = _build_cmd_line(
+                    cur_bin, cur_ids, gen_len, prefix_cache,
+                    prompt_ids, full_snap_prep_ref, compression_fired)
+
+            try:
+                _write_cmd(cmd_line)
+            except RuntimeError as e:
+                return JSONResponse({"detail": str(e)}, status_code=503)
+
+            # FIX 6: use run_in_executor instead of list() blocking event loop
+            tokens = await _collect_tokens_sync(r_pipe, gen_len)
+
+            full_snap_prep = full_snap_prep_ref[0]
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+            elif snap_prep:
+                prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+
+        if full_hit is None:
+            try: cur_bin.unlink()
+            except Exception: pass
+        else:
+            try: prompt_bin.unlink()
+            except Exception: pass
+
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         return JSONResponse({
             "id": completion_id,
@@ -351,53 +561,18 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                       "total_tokens": prompt_len + len(tokens)},
         })
 
-    # ── Anthropic Messages API ──────────────────────────────────────
-    # Mirrors the OpenAI endpoint but formatted for the Anthropic SDK.
-    # `?beta=true` (or any other query params) are accepted and ignored.
-
-    def _anthropic_text_from_content(content) -> str:
-        if isinstance(content, str):
-            return content
-        # list of blocks — concatenate the text blocks, ignore images/tools
-        parts = []
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "text":
-                parts.append(b.get("text", ""))
-        return "".join(parts)
+    # ── Anthropic Messages API ──────────────────────────────────────────────
 
     def _tokenize_anthropic(req: AnthropicMessagesRequest
                             ) -> tuple[Path, list[int], list[dict]]:
         msgs = []
-        system_text = _anthropic_text_from_content(req.system) if req.system else None
+        system_text = _content_to_str(req.system) if req.system else None
         if system_text:
             msgs.append({"role": "system", "content": system_text})
         for m in req.messages:
-            msgs.append({"role": m.role,
-                         "content": _anthropic_text_from_content(m.content)})
+            msgs.append({"role": m.role, "content": _content_to_str(m.content)})
         path, ids, _prompt = _render_messages(msgs)
         return path, ids, msgs
-
-    async def _astream_tokens(r, n_gen):
-        """Yields one token at a time without blocking the event loop.
-        Each 4-byte pipe read is dispatched to a worker thread."""
-        generated = 0
-        hit_stop = False
-        while True:
-            b = await asyncio.to_thread(os.read, r, 4)
-            if not b or len(b) < 4:
-                break
-            tok_id = struct.unpack("<i", b)[0]
-            if tok_id == -1:
-                break
-            if hit_stop:
-                continue
-            if tok_id in stop_ids:
-                hit_stop = True
-                continue
-            generated += 1
-            yield tok_id
-            if generated >= n_gen:
-                hit_stop = True
 
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest):
@@ -406,21 +581,44 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
-                # Hold the lock across the ENTIRE read cycle so concurrent
-                # requests don't interleave tokens through the shared pipe.
                 async with daemon_lock:
-                    cur_bin, cur_ids = await asyncio.to_thread(
-                        _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
-                    prompt_len = len(cur_ids)
-                    gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
-                    if gen_len <= 0:
-                        try: cur_bin.unlink()
-                        except Exception: pass
-                        err = {"type": "error",
-                               "error": {"type": "invalid_request_error",
-                                         "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}}
-                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
-                        return
+                    full_snap_prep_ref = [None]
+                    snap_prep = None
+
+                    full_hit = prefix_cache.lookup_full(prompt_ids)
+                    if full_hit is not None:
+                        slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                        cur_bin = Path(cached_cur_bin)
+                        cur_ids = None
+                        prompt_len = cached_cur_ids_len
+                        gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                        if gen_len <= 0:
+                            try: prompt_bin.unlink()
+                            except Exception: pass
+                            err = {"type": "error",
+                                   "error": {"type": "invalid_request_error",
+                                             "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}}
+                            yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                            return
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                    else:
+                        cur_bin, cur_ids = await asyncio.to_thread(
+                            _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
+                        prompt_len = len(cur_ids)
+                        gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                        if gen_len <= 0:
+                            try: cur_bin.unlink()
+                            except Exception: pass
+                            err = {"type": "error",
+                                   "error": {"type": "invalid_request_error",
+                                             "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}}
+                            yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                            return
+                        compression_fired = (cur_bin != prompt_bin)
+                        cmd_line, snap_prep = _build_cmd_line(
+                            cur_bin, cur_ids, gen_len, prefix_cache,
+                            prompt_ids, full_snap_prep_ref, compression_fired)
+
                     message_start = {
                         "type": "message_start",
                         "message": {
@@ -431,16 +629,13 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                         },
                     }
                     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
 
-                    cb_start = {
-                        "type": "content_block_start", "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
-
-                    cmd_line = f"{cur_bin} {gen_len}\n"
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    try:
+                        _write_cmd(cmd_line)
+                    except RuntimeError as e:
+                        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'server_error','message':str(e)}})}\n\n"
+                        return
 
                     out_tokens = 0
                     try:
@@ -453,11 +648,21 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                             }
                             yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
                     finally:
-                        try: cur_bin.unlink()
-                        except Exception: pass
+                        if full_hit is None:
+                            try: cur_bin.unlink()
+                            except Exception: pass
+                        else:
+                            try: prompt_bin.unlink()
+                            except Exception: pass
+
+                    full_snap_prep = full_snap_prep_ref[0]
+                    if full_snap_prep is not None:
+                        fslot, _ = full_snap_prep
+                        prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+                    elif snap_prep:
+                        prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
                     msg_delta = {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
@@ -468,27 +673,66 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        # Non-streaming
+        # Non-streaming Anthropic
         async with daemon_lock:
-            cur_bin, cur_ids = await asyncio.to_thread(
-                _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
-            prompt_len = len(cur_ids)
-            gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
-            if gen_len <= 0:
-                try: cur_bin.unlink()
-                except Exception: pass
-                return JSONResponse(
-                    {"type": "error",
-                     "error": {"type": "invalid_request_error",
-                               "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
-                    status_code=400)
-            cmd_line = f"{cur_bin} {gen_len}\n"
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
-            tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
+            full_snap_prep_ref = [None]
+            snap_prep = None
 
-        try: cur_bin.unlink()
-        except Exception: pass
+            full_hit = prefix_cache.lookup_full(prompt_ids)
+            if full_hit is not None:
+                slot, cached_cur_bin, cached_cur_ids_len = full_hit
+                cur_bin = Path(cached_cur_bin)
+                cur_ids = None
+                prompt_len = cached_cur_ids_len
+                gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                if gen_len <= 0:
+                    try: prompt_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse(
+                        {"type": "error", "error": {"type": "invalid_request_error",
+                         "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
+                        status_code=400)
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+            else:
+                cur_bin, cur_ids = await asyncio.to_thread(
+                    _maybe_compress, raw_msgs, prompt_bin, prompt_ids)
+                prompt_len = len(cur_ids)
+                gen_len = min(req.max_tokens, max_ctx - prompt_len - 20)
+                if gen_len <= 0:
+                    try: cur_bin.unlink()
+                    except Exception: pass
+                    return JSONResponse(
+                        {"type": "error", "error": {"type": "invalid_request_error",
+                         "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
+                        status_code=400)
+                compression_fired = (cur_bin != prompt_bin)
+                cmd_line, snap_prep = _build_cmd_line(
+                    cur_bin, cur_ids, gen_len, prefix_cache,
+                    prompt_ids, full_snap_prep_ref, compression_fired)
+
+            try:
+                _write_cmd(cmd_line)
+            except RuntimeError as e:
+                return JSONResponse({"type": "error", "error": {"type": "server_error",
+                                     "message": str(e)}}, status_code=503)
+
+            # FIX 6: use run_in_executor — same fix as OpenAI non-streaming path
+            tokens = await _collect_tokens_sync(r_pipe, gen_len)
+
+            full_snap_prep = full_snap_prep_ref[0]
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+            elif snap_prep:
+                prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+
+        if full_hit is None:
+            try: cur_bin.unlink()
+            except Exception: pass
+        else:
+            try: prompt_bin.unlink()
+            except Exception: pass
+
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         return JSONResponse({
             "id": msg_id,
@@ -513,43 +757,27 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    # Attention compute currently scales with --max-ctx, not the actual
-    # prompt+gen length (see https://github.com/Luce-Org/lucebox-hub/issues/10).
-    # Default 16384 fits most API workloads without the 20×+ slowdown users
-    # hit with --max-ctx=131072 on short requests. Bump via --max-ctx if you
-    # actually need long-context serving.
     default_ctx = 16384
     ap.add_argument("--max-ctx", type=int, default=default_ctx,
                     help=f"Maximum context length (default: {default_ctx}; "
                          "oversizing this — e.g. 131072 on short prompts — "
                          "can slow attention 20×+ until issue #10 is fixed)")
     ap.add_argument("--kv-f16", action="store_true",
-                    help="Force F16 KV cache. When --max-ctx > 6144 the server "
-                         "auto-enables TQ3_0 KV to fit; pass --kv-f16 to opt out.")
+                    help="Force F16 KV cache.")
     ap.add_argument("--cache-type-k", "--ctk", dest="cache_type_k", default=None,
-                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"],
-                    help="K cache element type (overrides --kv-q4/--kv-tq3/--kv-f16 for K). "
-                         "See kv_quant.cpp for supported (K,V) pairs.")
+                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"])
     ap.add_argument("--cache-type-v", "--ctv", dest="cache_type_v", default=None,
-                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"],
-                    help="V cache element type (overrides --kv-q4/--kv-tq3/--kv-f16 for V).")
+                    choices=["f16","bf16","q4_0","q4_1","q5_0","q5_1","q8_0","tq3_0"])
     ap.add_argument("--fa-window", type=int, default=None,
-                    help="Sliding window for FA layers (KV positions). 0 = full "
-                         "attention. Default 2048 (set in C++); only kicks in "
-                         "once kv_cache > window. Trades attention range for "
-                         "long-context decode speed.")
-    ap.add_argument("--tokenizer", type=str, default=None,
-                    help="HuggingFace tokenizer repo ID (default: auto-detect "
-                         "from target GGUF basename; falls back to Qwen/Qwen3.5-27B)")
-    ap.add_argument("--daemon", action="store_true", help="Run with persistent model daemon (now default)")
+                    help="Sliding window for FA layers. 0 = full attention.")
+    ap.add_argument("--tokenizer", type=str, default=None)
+    ap.add_argument("--prefix-cache-slots", type=int, default=4)
+    ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    ap.add_argument("--daemon", action="store_true")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
 
-    # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
-    # Clients like Claude Code routinely send 10k+ token system prompts, so
-    # 6144 is too tight for real-world use. setdefault so an explicit user
-    # DFLASH27B_KV_TQ3=0 still wins.
     if args.cache_type_k:
         os.environ["DFLASH27B_KV_K"] = args.cache_type_k
     if args.cache_type_v:
@@ -560,13 +788,11 @@ def main():
     if args.fa_window is not None:
         os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
 
-    # When pflash is on, the daemon needs the same memory-tight env the bench
-    # harness uses (otherwise the LM-head dequant buffer fragments cudaMalloc
-    # after the compress dance and the post-compress draft graph reserve
-    # OOMs). setdefault so explicit user overrides still win.
     if args.prefill_compression != "off":
         os.environ.setdefault("DFLASH27B_LM_HEAD_FIX", "0")
         os.environ.setdefault("DFLASH27B_FA_WINDOW", "0")
+        os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
+        os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")
@@ -591,7 +817,9 @@ def main():
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
-                    drafter_tokenizer=drafter_tokenizer)
+                    drafter_tokenizer=drafter_tokenizer,
+                    prefix_cache_slots=args.prefix_cache_slots,
+                    prefill_cache_slots=args.prefill_cache_slots)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")

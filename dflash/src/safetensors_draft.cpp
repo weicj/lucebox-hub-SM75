@@ -381,14 +381,20 @@ bool load_draft_safetensors(const std::string & path,
     out.ctx = ggml_init(ip);
     if (!out.ctx) { set_last_error("ggml_init failed for draft ctx"); return false; }
     out.backend = backend;
+    out.n_layer   = n_layers;
+    out.n_head    = DFLASH27B_TARGET_N_HEADS;
+    out.n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;
+    out.head_dim  = DFLASH27B_TARGET_HEAD_DIM;
+    out.n_embd    = DFLASH27B_TARGET_HIDDEN;
+    out.n_ff      = DFLASH27B_TARGET_INTERMEDIATE;
     out.layers.assign(n_layers, DraftLayer{});
 
-    const int64_t HIDDEN  = DFLASH27B_TARGET_HIDDEN;           // 5120
-    const int64_t Q_DIM   = DFLASH27B_TARGET_N_HEADS * DFLASH27B_TARGET_HEAD_DIM;     // 4096
-    const int64_t KV_DIM  = DFLASH27B_TARGET_N_KV_HEADS * DFLASH27B_TARGET_HEAD_DIM;  // 1024
-    const int64_t INTER   = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
-    const int64_t HD      = DFLASH27B_TARGET_HEAD_DIM;         // 128
-    const int64_t FC_IN   = DFLASH27B_DRAFT_N_TARGET_LAYERS * HIDDEN; // 25600
+    const int64_t HIDDEN  = out.n_embd;
+    const int64_t Q_DIM   = out.n_head * out.head_dim;
+    const int64_t KV_DIM  = out.n_head_kv * out.head_dim;
+    const int64_t INTER   = out.n_ff;
+    const int64_t HD      = out.head_dim;
+    const int64_t FC_IN   = DFLASH27B_DRAFT_N_TARGET_LAYERS * HIDDEN;
 
     // ── 4. Create named tensors in the context ───────────────────
     //
