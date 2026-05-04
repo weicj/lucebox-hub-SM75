@@ -343,64 +343,84 @@ Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
 
 Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
 
-Runtime config:
-- `keep_ratio=0.05`
-- `alpha=0.70` (with `DFLASH_FP_USE_BSA=1`)
-- `ddtree_budget=22`
-- `fa_window=4096`
-- `kv_tq3=0` (FP16 KV cache; 5090 has VRAM headroom)
-- `n_gen=1024`
+Final ("V4") runtime config — driven via the `pflash/tests/bench_niah_cpp.py`
+CLI flags added in #90 plus daemon env vars; the bracketed names are the
+exact interfaces:
+
+- `--keep-ratio=0.05` (PFlash compression target ratio)
+- `DFLASH_FP_USE_BSA=1` env, `--alpha=0.70` (BSA enabled, block-selection threshold)
+- `--ddtree-budget=22`
+- `--fa-window=4096` (also settable via `DFLASH27B_FA_WINDOW=4096`)
+- `--kv-tq3=0` (FP16 KV cache; 5090 has VRAM headroom)
+- `--n-gen=1024`
 
 Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
-native RoPE limit, generated with `niah_gen.py` at calibrated
-`char_per_tok`).
+native RoPE limit, generated with [`pflash/tests/niah_gen.py`](../pflash/tests/niah_gen.py)
+at calibrated `char_per_tok`).
 
 ### RTX 5090 long-ctx headline
 
 | Metric                 | Value                              |
 |------------------------|------------------------------------|
 | NIAH accuracy          | **20/20** across 2 runs of n=10    |
-| Decode throughput      | 210.7 t/s avg (range 179–230)      |
+| Decode throughput      | 210.7 tok/s avg (range 179–230)    |
 | TTFT                   | 10.0 s                             |
 | Compression            | 20.2× (117064 → 5800 tokens)       |
 | Prefill (compressed)   | 3.9 s for ~5800 tokens             |
 | Drafter score+migrate  | ~5.8 s                             |
 
-### Cross-reference: budget=22 holds across context regimes
+These headline numbers are the **Phase 4 reliability run** at the V4 config
+above (n=20 across 2 independent runs of 10 prompts each). The three
+exploratory sweeps below — alpha, then budget, then keep — are what
+*selected* the V4 config; each table holds the non-swept parameters at the
+values discovered in the prior phase, so the swept-axis throughput numbers
+are not directly comparable to the headline (different keep ratios produce
+different per-step decode rates, see the keep-ratio table below).
 
-The short-context budget sweep above identifies budget=22 as the
-throughput-optimal default at HumanEval-scale prompts (211.20 mean tok/s
-at AL 7.25). My long-context sweep at 117K NIAH also converges on
-budget=22:
+### Phase 1 — alpha sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
 
-| Budget | Long-ctx NIAH @ 117K | Decode t/s |
-|:------:|:--------------------:|:----------:|
-| **22** | 10/10                | **217.4**  |
-| 28     | 10/10                | 210.7      |
-| 30     | 10/10                | 211.1      |
+| `--alpha` | NIAH    | Decode tok/s |
+|:---------:|:-------:|:------------:|
+| 0.60      | 10/10   | 213.7        |
+| **0.70**  | 10/10   | 210.6        |
+| 0.85      | **8/10**| 204.6        |
 
-Budget=22 is therefore a stable default for Qwen3.6-27B on Blackwell across
-both regimes, not a knob that needs per-context-length tuning.
+The docs default of `--alpha=0.85` fails 2/10 prompts at this setup. This
+may be specific to long context, Qwen3.6, or Blackwell — I have not
+isolated which. Validating `alpha` per setup is recommended. I chose 0.70
+over 0.60 for reliability margin: 0.60 wins decode by only 1.5%, below the
+run-to-run variance, on an n=10 sample.
 
-### Note on `kv_tq3`
+### Phase 2 — budget sweep (held: `--alpha=0.70`, `--keep-ratio=0.08`)
 
-I set `kv_tq3=0` (FP16 KV cache). 3-bit KV cache trades VRAM for memory
+| `--ddtree-budget` | NIAH | Decode tok/s |
+|:-----------------:|:----:|:------------:|
+| **22**            | 10/10| **217.4**    |
+| 28                | 10/10| 210.7        |
+| 30                | 10/10| 211.1        |
+
+#86's short-context budget sweep above on the same 5090 build also lands
+on budget=22 as throughput-optimal (211.20 mean tok/s at AL 7.25). So
+**budget=22 is a stable default for Qwen3.6-27B on Blackwell across
+context regimes**, not a knob that needs per-context-length tuning. This
+is the most useful cross-reference between the two sections.
+
+### Phase 3 — keep-ratio sweep (held: `--alpha=0.70`, `--ddtree-budget=22`)
+
+| `--keep-ratio` | NIAH    | Decode tok/s | TTFT    | Compression |
+|:--------------:|:-------:|:------------:|:-------:|:-----------:|
+| **0.05**       | 10/10   | 210.4        | 10.0 s  | 20.2×       |
+| 0.06           | 10/10   | 212.1        | 10.5 s  | 16.8×       |
+| 0.08           | 10/10   | 216.5        | 13.0 s  | 12.6×       |
+
+`--keep-ratio=0.08` wins per-token throughput by ~3% but pays 30% more
+TTFT and gives up 38% of the compression. For the 117K NIAH workload I
+chose 0.05 to optimize end-to-end response latency; 0.08 is preferable
+when sustained throughput on already-compressed prompts dominates.
+
+### Note on `--kv-tq3`
+
+I set `--kv-tq3=0` (FP16 KV cache). 3-bit KV cache trades VRAM for memory
 bandwidth; on a 5090 with 32 GB and ~22 GB peak usage at 117K, the
 bandwidth trade is not worth it. Users on 4090 or 3090 (24 GB) at this
-context length should likely keep `kv_tq3=1`.
-
-### Note on `alpha`
-
-I tested `alpha=0.60, 0.70, 0.85` at this configuration:
-
-| Alpha | NIAH    | Decode t/s |
-|:-----:|:-------:|:----------:|
-| 0.60  | 10/10   | 213.7      |
-| 0.70  | 10/10   | 210.6      |
-| 0.85  | **8/10**| 204.6      |
-
-The docs default of 0.85 fails 2 prompts at this setup. This may be
-specific to long context, Qwen3.6, or Blackwell — I have not isolated
-which. Either way, validating `alpha` per setup is recommended. I chose
-0.70 over 0.60 for reliability margin (n=10 sample; 0.60 wins decode by
-only 1.5%, below the run-to-run variance).
+context length should likely keep `--kv-tq3=1`.
