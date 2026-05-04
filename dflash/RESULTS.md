@@ -344,14 +344,14 @@ Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
 Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
 
 Final ("V4") runtime config — driven via the `pflash/tests/bench_niah_cpp.py`
-CLI flags added in #90 plus daemon env vars; the bracketed names are the
-exact interfaces:
+CLI flags added in #90 plus daemon env vars (each bullet leads with the
+exact interface):
 
 - `--keep-ratio=0.05` (PFlash compression target ratio)
-- `DFLASH_FP_USE_BSA=1` env, `--alpha=0.70` (BSA enabled, block-selection threshold)
+- `DFLASH_FP_USE_BSA=1` and `DFLASH_FP_ALPHA=0.70` (BSA enabled, block-selection threshold; both are daemon env vars)
 - `--ddtree-budget=22`
 - `--fa-window=4096` (also settable via `DFLASH27B_FA_WINDOW=4096`)
-- `--kv-tq3=0` (FP16 KV cache; 5090 has VRAM headroom)
+- `--kv-tq3=0` (Q8_0 KV cache — the daemon default when TQ3_0 is disabled and no other KV type is set; 5090 has VRAM headroom so TQ3_0 isn't needed)
 - `--n-gen=1024`
 
 Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
@@ -377,21 +377,21 @@ values discovered in the prior phase, so the swept-axis throughput numbers
 are not directly comparable to the headline (different keep ratios produce
 different per-step decode rates, see the keep-ratio table below).
 
-### Phase 1 — alpha sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
+### Phase 1 — `DFLASH_FP_ALPHA` sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
 
-| `--alpha` | NIAH    | Decode tok/s |
-|:---------:|:-------:|:------------:|
-| 0.60      | 10/10   | 213.7        |
-| **0.70**  | 10/10   | 210.6        |
-| 0.85      | **8/10**| 204.6        |
+| `DFLASH_FP_ALPHA` | NIAH    | Decode tok/s |
+|:-----------------:|:-------:|:------------:|
+| 0.60              | 10/10   | 213.7        |
+| **0.70**          | 10/10   | 210.6        |
+| 0.85              | **8/10**| 204.6        |
 
-The docs default of `--alpha=0.85` fails 2/10 prompts at this setup. This
-may be specific to long context, Qwen3.6, or Blackwell — I have not
-isolated which. Validating `alpha` per setup is recommended. I chose 0.70
-over 0.60 for reliability margin: 0.60 wins decode by only 1.5%, below the
-run-to-run variance, on an n=10 sample.
+The docs default of `DFLASH_FP_ALPHA=0.85` fails 2/10 prompts at this
+setup. This may be specific to long context, Qwen3.6, or Blackwell — I
+have not isolated which. Validating alpha per setup is recommended. I
+chose 0.70 over 0.60 for reliability margin: 0.60 wins decode by only
+1.5%, below the run-to-run variance, on an n=10 sample.
 
-### Phase 2 — budget sweep (held: `--alpha=0.70`, `--keep-ratio=0.08`)
+### Phase 2 — budget sweep (held: `DFLASH_FP_ALPHA=0.70`, `--keep-ratio=0.08`)
 
 | `--ddtree-budget` | NIAH | Decode tok/s |
 |:-----------------:|:----:|:------------:|
@@ -405,7 +405,7 @@ on budget=22 as throughput-optimal (211.20 mean tok/s at AL 7.25). So
 context regimes**, not a knob that needs per-context-length tuning. This
 is the most useful cross-reference between the two sections.
 
-### Phase 3 — keep-ratio sweep (held: `--alpha=0.70`, `--ddtree-budget=22`)
+### Phase 3 — keep-ratio sweep (held: `DFLASH_FP_ALPHA=0.70`, `--ddtree-budget=22`)
 
 | `--keep-ratio` | NIAH    | Decode tok/s | TTFT    | Compression |
 |:--------------:|:-------:|:------------:|:-------:|:-----------:|
@@ -420,7 +420,10 @@ when sustained throughput on already-compressed prompts dominates.
 
 ### Note on `--kv-tq3`
 
-I set `--kv-tq3=0` (FP16 KV cache). 3-bit KV cache trades VRAM for memory
-bandwidth; on a 5090 with 32 GB and ~22 GB peak usage at 117K, the
-bandwidth trade is not worth it. Users on 4090 or 3090 (24 GB) at this
-context length should likely keep `--kv-tq3=1`.
+I set `--kv-tq3=0`, which leaves the daemon at its Q8_0 KV-cache default
+(no `DFLASH27B_KV_K`/`DFLASH27B_KV_V` overrides). The 3-bit TQ3_0 cache
+trades VRAM for memory bandwidth; on a 5090 with 32 GB and ~22 GB peak
+usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
+(24 GB) at this context length should likely keep `--kv-tq3=1`. To go
+further than Q8_0 in either direction set the K/V types explicitly via
+`DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
