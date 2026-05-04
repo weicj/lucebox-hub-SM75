@@ -31,7 +31,39 @@ def main():
                     help="3-bit KV cache; saves VRAM")
     ap.add_argument("--auto-max-ctx", action="store_true",
                     help="Auto-size --max-ctx based on src tokens")
+    ap.add_argument("--bsa", type=int, choices=[0, 1], default=None,
+                    help="Enable BSA (Block-Sparse Attention) for the drafter "
+                         "scoring forward. Required for valid NIAH validation "
+                         "at long ctx. Falls back to DFLASH_FP_USE_BSA env var "
+                         "when unset.")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="BSA block-selection threshold. Falls back to "
+                         "DFLASH_FP_ALPHA env var when unset. Validate per "
+                         "setup; e.g. alpha=0.85 fails 2/10 NIAH at 117K on "
+                         "Qwen3.6-27B / RTX 5090.")
     args = ap.parse_args()
+
+    # CLI flags take priority over env vars; warn on misconfigurations that
+    # silently degrade NIAH (BSA off → WMMA fallback ~3.4x slower; BSA on
+    # without alpha → daemon hardcoded default, not reproducible).
+    bsa_enabled = (args.bsa if args.bsa is not None
+                   else int(os.environ.get("DFLASH_FP_USE_BSA", "0")))
+    alpha = (args.alpha if args.alpha is not None
+             else (float(os.environ["DFLASH_FP_ALPHA"])
+                   if "DFLASH_FP_ALPHA" in os.environ else None))
+    if not bsa_enabled:
+        print("[warn] BSA disabled. NIAH validation requires BSA enabled "
+              "(--bsa 1 or DFLASH_FP_USE_BSA=1); the WMMA fallback path is "
+              "~3.4x slower at long ctx and silently fails NIAH.",
+              flush=True)
+    elif alpha is None:
+        print("[warn] BSA enabled but neither --alpha nor DFLASH_FP_ALPHA set; "
+              "daemon will use its hardcoded default. For reproducible "
+              "benchmarks, set --alpha explicitly.", flush=True)
+    if bsa_enabled:
+        os.environ["DFLASH_FP_USE_BSA"] = "1"
+    if alpha is not None:
+        os.environ["DFLASH_FP_ALPHA"] = str(alpha)
 
     target_tok = AutoTokenizer.from_pretrained(args.target_tokenizer)
     drafter_tok = AutoTokenizer.from_pretrained(args.drafter_tokenizer)
