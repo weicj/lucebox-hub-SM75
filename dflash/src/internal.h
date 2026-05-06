@@ -141,11 +141,22 @@ struct TargetWeights {
     int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
+struct TargetLoadPlan {
+    int  layer_begin = 0;     // inclusive
+    int  layer_end   = -1;    // exclusive; <0 means all layers
+    bool load_output = true;  // output_norm + lm_head
+};
+
 // Load a Q4_K_M target model from a GGUF file on disk.
 // Returns false and sets last_error on failure.
 bool load_target_gguf(const std::string & path,
                       ggml_backend_t backend,
                       TargetWeights & out);
+
+bool load_target_gguf_partial(const std::string & path,
+                              ggml_backend_t backend,
+                              const TargetLoadPlan & plan,
+                              TargetWeights & out);
 
 void free_target_weights(TargetWeights & w);
 
@@ -368,6 +379,16 @@ bool create_target_cache(const TargetWeights & w,
                          ggml_backend_t backend,
                          TargetCache & out,
                          bool prefill_only = false);
+
+bool create_target_cache_partial(const TargetWeights & w,
+                                 int max_ctx,
+                                 int max_verify_tokens,
+                                 ggml_backend_t backend,
+                                 TargetCache & out,
+                                 bool prefill_only,
+                                 int layer_begin,
+                                 int layer_end,
+                                 bool allocate_target_feat);
 
 void free_target_cache(TargetCache & c);
 

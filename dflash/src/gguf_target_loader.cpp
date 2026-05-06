@@ -48,8 +48,10 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -185,11 +187,61 @@ uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback)
     return gguf_get_val_u32(g, id);
 }
 
+static size_t align_up_size(size_t x, size_t a) {
+    if (a == 0) return x;
+    const size_t r = x % a;
+    return r == 0 ? x : x + (a - r);
+}
+
+static bool parse_block_tensor_name(const char * name, int & layer_id) {
+    const char prefix[] = "blk.";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    if (std::strncmp(name, prefix, prefix_len) != 0) return false;
+    const char * p = name + prefix_len;
+    if (*p < '0' || *p > '9') return false;
+    char * end = nullptr;
+    long v = std::strtol(p, &end, 10);
+    if (!end || *end != '.' || v < 0 || v > INT32_MAX) return false;
+    layer_id = (int)v;
+    return true;
+}
+
+static bool should_load_target_tensor(const char * name,
+                                      int layer_begin,
+                                      int layer_end,
+                                      bool load_output) {
+    if (std::strcmp(name, "token_embd.weight") == 0) return false;
+    if (std::strcmp(name, "output_norm.weight") == 0 ||
+        std::strcmp(name, "output.weight") == 0) {
+        return load_output;
+    }
+    int layer_id = -1;
+    if (parse_block_tensor_name(name, layer_id)) {
+        return layer_id >= layer_begin && layer_id < layer_end;
+    }
+    return false;
+}
+
+struct TargetTensorAlloc {
+    ggml_tensor * tensor = nullptr;
+    size_t file_offset = 0;
+    size_t file_size = 0;
+    size_t buffer_offset = 0;
+};
+
 } // namespace
 
 bool load_target_gguf(const std::string & path,
                       ggml_backend_t       backend,
                       TargetWeights &      out) {
+    TargetLoadPlan plan;
+    return load_target_gguf_partial(path, backend, plan, out);
+}
+
+bool load_target_gguf_partial(const std::string & path,
+                              ggml_backend_t       backend,
+                              const TargetLoadPlan & plan_in,
+                              TargetWeights &      out) {
 
     // ── 1. Parse metadata + create a ggml_context holding tensor descriptors ─
     ggml_context * meta_ctx = nullptr;
@@ -310,6 +362,20 @@ bool load_target_gguf(const std::string & path,
         }
     }
 
+    TargetLoadPlan plan = plan_in;
+    if (plan.layer_begin < 0) plan.layer_begin = 0;
+    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    if (plan.layer_begin > plan.layer_end ||
+        plan.layer_end > (int)n_layer) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "invalid target load layer range [%d,%d) for n_layer=%u",
+            plan.layer_begin, plan.layer_end, n_layer);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
     out.ctx     = meta_ctx;
     out.backend = backend;
     out.n_layer = (int)n_layer;
@@ -425,12 +491,48 @@ bool load_target_gguf(const std::string & path,
         }
     }
 
-    // ── 3. Allocate CUDA buffer for all tensors in meta_ctx ───────────
-    out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
+    // 3. Allocate CUDA buffer only for the selected target tensors.
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    std::vector<TargetTensorAlloc> allocs;
+    size_t alloc_total = 0;
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (int64_t tid = 0; tid < n_tensors; tid++) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+            continue;
+        }
+        alloc_total = align_up_size(alloc_total, alignment);
+        TargetTensorAlloc a;
+        a.tensor = t;
+        a.file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
+        a.file_size = gguf_get_tensor_size(gctx, tid);
+        a.buffer_offset = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
+        allocs.push_back(a);
+    }
+    if (allocs.empty()) {
+        set_last_error("target load plan selected no GPU tensors");
+        gguf_free(gctx);
+        return false;
+    }
+
+    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
     if (!out.buf) {
         set_last_error("ggml_backend_alloc_ctx_tensors failed (target)");
         gguf_free(gctx);
         return false;
+    }
+    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+    for (const TargetTensorAlloc & a : allocs) {
+        if (ggml_backend_tensor_alloc(out.buf, a.tensor, base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+            set_last_error("ggml_backend_tensor_alloc failed (target)");
+            gguf_free(gctx);
+            return false;
+        }
     }
 
     // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
@@ -441,7 +543,6 @@ bool load_target_gguf(const std::string & path,
     Mmap mm;
     if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
     const size_t data_start = gguf_get_data_offset(gctx);
-    const int64_t n_tensors = gguf_get_n_tensors(gctx);
 
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
@@ -462,6 +563,9 @@ bool load_target_gguf(const std::string & path,
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
+            continue;
+        }
+        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
             continue;
         }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
@@ -495,8 +599,9 @@ bool load_target_gguf(const std::string & path,
     // Stash the total for callers that want to print it
     char summary[192];
     std::snprintf(summary, sizeof(summary),
-        "target loaded: %" PRId64 " tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
-        n_tensors, total / (1024.0 * 1024.0 * 1024.0),
+        "target loaded: layers [%d,%d) output=%d, %zu tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
+        plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size(),
+        total / (1024.0 * 1024.0 * 1024.0),
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
 

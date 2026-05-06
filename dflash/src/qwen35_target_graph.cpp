@@ -43,6 +43,26 @@ bool create_target_cache(const TargetWeights & w,
                          ggml_backend_t backend,
                          TargetCache & out,
                          bool prefill_only) {
+    return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
+                                       out, prefill_only,
+                                       0, w.n_layer, true);
+}
+
+bool create_target_cache_partial(const TargetWeights & w,
+                                 int max_ctx,
+                                 int max_verify_tokens,
+                                 ggml_backend_t backend,
+                                 TargetCache & out,
+                                 bool prefill_only,
+                                 int layer_begin,
+                                 int layer_end,
+                                 bool allocate_target_feat) {
+    if (layer_begin < 0) layer_begin = 0;
+    if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
+    if (layer_begin > layer_end) {
+        set_last_error("invalid target cache layer range");
+        return false;
+    }
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
@@ -88,7 +108,9 @@ bool create_target_cache(const TargetWeights & w,
         const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
         for (int il = 0; il < w.n_layer; il++) {
             const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            const bool owns_layer = il >= layer_begin && il < layer_end;
             if (is_attn) {
+                if (!owns_layer) { fa_idx++; continue; }
                 // [head_dim, max_ctx_alloc, n_head_kv]
                 ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
                                                      head_dim, max_ctx_alloc, w.n_head_kv);
@@ -103,6 +125,7 @@ bool create_target_cache(const TargetWeights & w,
                 out.attn_v[fa_idx] = V;
                 fa_idx++;
             } else {
+                if (!owns_layer) { dn_idx++; continue; }
                 // ssm_state: [head_v_dim, head_v_dim, num_v_heads]
                 ggml_tensor * S = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
                                                      head_v_dim, head_v_dim, w.ssm_dt_rank);
@@ -120,9 +143,13 @@ bool create_target_cache(const TargetWeights & w,
 
         constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
         out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
-        const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * w.n_embd;  // 25600
-        out.target_feat = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_BF16, fc_in, out.target_feat_cap);
-        ggml_set_name(out.target_feat, "target_feat");
+        if (allocate_target_feat) {
+            const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * w.n_embd;  // 25600
+            out.target_feat = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_BF16, fc_in, out.target_feat_cap);
+            ggml_set_name(out.target_feat, "target_feat");
+        } else {
+            out.target_feat = nullptr;
+        }
 
         out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
         if (!out.base_buf) {
@@ -148,6 +175,8 @@ bool create_target_cache(const TargetWeights & w,
         const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
         for (int il = 0; il < w.n_layer; il++) {
             if (((il + 1) % w.full_attention_interval) != 0) {
+                const bool owns_layer = il >= layer_begin && il < layer_end;
+                if (!owns_layer) { dn_idx++; continue; }
                 ggml_tensor * Sn = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
                                                        head_v_dim, head_v_dim, w.ssm_dt_rank);
                 ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
@@ -327,14 +356,18 @@ bool migrate_prefill_cache(const TargetWeights & w,
 // tensor copy (ggml_backend_tensor_copy). Called outside of any compute graph.
 void snapshot_ssm_state(TargetCache & c) {
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state[i] || !c.ssm_state_snap[i]) continue;
         ggml_backend_tensor_copy(c.ssm_state[i], c.ssm_state_snap[i]);
+        if (!c.conv_state[i] || !c.conv_state_snap[i]) continue;
         ggml_backend_tensor_copy(c.conv_state[i], c.conv_state_snap[i]);
     }
 }
 
 void restore_ssm_state(TargetCache & c) {
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state_snap[i] || !c.ssm_state[i]) continue;
         ggml_backend_tensor_copy(c.ssm_state_snap[i], c.ssm_state[i]);
+        if (!c.conv_state_snap[i] || !c.conv_state[i]) continue;
         ggml_backend_tensor_copy(c.conv_state_snap[i], c.conv_state[i]);
     }
 }

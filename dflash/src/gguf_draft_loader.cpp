@@ -6,10 +6,12 @@
 // types — ggml's ggml_mul_mat handles Q8_0 × F32 dequantization transparently.
 //
 // GGUF arch: "qwen35-dflash-draft" (from convert_dflash_to_gguf.py /
-// quantize_draft_q8.py). Tensor naming convention:
+// quantize_draft_q8.py) or the newer "dflash-draft" export. Tensor naming
+// convention:
 //
-//   dflash.fc.weight                        [5*hidden, hidden]  Q8_0 / F16
-//   dflash.hidden_norm.weight               [hidden]            F32
+//   dflash.fc.weight / dflash_fc.weight     [5*hidden, hidden]  Q8_0 / F16
+//   dflash.hidden_norm.weight /
+//   dflash_hidden_norm.weight               [hidden]            F32
 //   output_norm.weight                      [hidden]            F32
 //   blk.<i>.attn_norm.weight                [hidden]            F32
 //   blk.<i>.ffn_norm.weight                 [hidden]            F32
@@ -132,16 +134,18 @@ bool load_draft_gguf(const std::string & path,
             return false;
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
-        if (std::string(arch) != "qwen35-dflash-draft") {
+        if (std::string(arch) != "qwen35-dflash-draft" &&
+            std::string(arch) != "dflash-draft") {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft)");
+                           " (expected qwen35-dflash-draft or dflash-draft)");
             gguf_free(gctx);
             return false;
         }
     }
 
     // Read dimensions from GGUF metadata
-    const char * A = "qwen35-dflash-draft";
+    int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+    const char * A = gguf_get_val_str(gctx, arch_id);
     char key[128];
 
     auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
@@ -156,7 +160,20 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t n_head_kv = read_u32("attention.head_count_kv", 0);
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
     const uint32_t block_sz  = read_u32("dflash.block_size",       0);
-    const uint32_t n_tgt_lay = read_u32("dflash.n_target_layers",  0);
+    uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
+    if (n_tgt_lay == 0) {
+        const uint32_t n_tgt_feat = read_u32("dflash.n_target_features", 0);
+        if (n_tgt_feat != 0 && n_embd != 0 && (n_tgt_feat % n_embd) == 0) {
+            n_tgt_lay = n_tgt_feat / n_embd;
+        }
+    }
+    if (n_tgt_lay == 0) {
+        std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
+        int64_t id = gguf_find_key(gctx, key);
+        if (id >= 0) {
+            n_tgt_lay = (uint32_t)gguf_get_arr_n(gctx, id);
+        }
+    }
 
     if (n_embd == 0 || n_layer == 0 || n_ff == 0 || n_head == 0 ||
         n_head_kv == 0 || head_dim == 0) {
@@ -224,12 +241,16 @@ bool load_draft_gguf(const std::string & path,
         return ggml_get_tensor(meta_ctx, name);
     };
 
-    out.fc          = g("dflash.fc.weight");
-    out.hidden_norm = g("dflash.hidden_norm.weight");
+    auto first = [](ggml_tensor * a, ggml_tensor * b) -> ggml_tensor * {
+        return a ? a : b;
+    };
+
+    out.fc          = first(g("dflash.fc.weight"), g("dflash_fc.weight"));
+    out.hidden_norm = first(g("dflash.hidden_norm.weight"), g("dflash_hidden_norm.weight"));
     out.out_norm    = g("output_norm.weight");
     if (!out.fc || !out.hidden_norm || !out.out_norm) {
         set_last_error("draft GGUF: missing top-level tensors "
-                       "(dflash.fc / dflash.hidden_norm / output_norm)");
+                       "(dflash fc / dflash hidden norm / output_norm)");
         gguf_free(gctx);
         return false;
     }
@@ -242,7 +263,7 @@ bool load_draft_gguf(const std::string & path,
         };
         DraftLayer & L = out.layers[il];
         L.attn_norm = fnd("attn_norm.weight");
-        L.ffn_norm  = fnd("ffn_norm.weight");
+        L.ffn_norm  = first(fnd("ffn_norm.weight"), fnd("post_attention_norm.weight"));
         L.wq        = fnd("attn_q.weight");
         L.wk        = fnd("attn_k.weight");
         L.wv        = fnd("attn_v.weight");

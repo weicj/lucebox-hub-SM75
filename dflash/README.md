@@ -95,6 +95,30 @@ DFLASH27B_KV_K=q8_0 DFLASH27B_KV_V=q4_0 ./test_dflash …
 ./test_dflash … --cache-type-k=q8_0 --cache-type-v=q4_0
 ```
 
+**Target layer-split harness on `test_dflash`:**
+```bash
+./test_dflash target.gguf draft.safetensors prompt.bin 128 out.bin \
+  --target-gpus=1,2,3,4 --target-layer-split=1,1,1,1
+
+./test_dflash target.gguf draft.safetensors prompt.bin 128 out.bin \
+  --draft-gpu=0 --target-gpus=0,1 --target-layer-split=1,3 \
+  --target-split-load-draft
+
+./test_dflash target.gguf draft.gguf prompt.bin 128 out.bin \
+  --draft-gpu=0 --target-gpus=0,1 --target-layer-split=1,1 \
+  --target-split-dflash
+```
+
+When more than one target GPU is listed, `test_dflash` runs a non-daemon
+target-only layer-split harness. Each target GPU loads only its assigned
+contiguous layer range; `output_norm` and `output.weight` stay on the last
+target GPU. `--target-split-load-draft` additionally loads the DFlash draft
+on `--draft-gpu` (`.safetensors` or quantized draft `.gguf`), captures target
+features into a draft-side mirror, and runs a small draft forward smoke. This
+allows capacity checks where the draft and a target layer range share one GPU
+before serving integration. `--target-split-dflash` runs the same split target
+placement through a chain DFlash decode loop and reports acceptance length.
+
 **Python flags on `scripts/run.py`, `scripts/server.py`, `scripts/server_tools.py`:**
 ```bash
 python3 scripts/run.py --ctk q8_0 --ctv q4_0 --prompt "hello"
