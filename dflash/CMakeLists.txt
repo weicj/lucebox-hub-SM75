@@ -197,6 +197,12 @@ if(DFLASH27B_ENABLE_BSA)
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/Block-Sparse-Attention/csrc/block_sparse_attn/src)
     target_compile_options(dflash27b PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     target_compile_definitions(dflash27b PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASH_NAMESPACE=flash DFLASH27B_HAVE_BSA=1)
+    # MSVC's <cmath> hides POSIX M_* macros (M_LOG2E etc.) unless _USE_MATH_DEFINES
+    # is set before any cmath include. BSA's softmax.h relies on M_LOG2E; define
+    # globally on the target so it precedes every TU's first <cmath> include.
+    if(WIN32)
+        target_compile_definitions(dflash27b PRIVATE _USE_MATH_DEFINES)
+    endif()
 endif()
 
 target_link_libraries(dflash27b
