@@ -71,7 +71,8 @@ bool create_target_cache(const TargetWeights & w,
 
     // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
     // standard quant types that keep fast FA kernel paths on all arches).
-    out.kv_k_rotated = true;
+    // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
+    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0);
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
