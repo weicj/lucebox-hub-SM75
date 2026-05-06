@@ -78,6 +78,8 @@ extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <random>
+#include <unordered_set>
 
 using namespace dflash27b;
 
@@ -116,6 +118,104 @@ static int argmax_f32(const float * x, int n) {
     float bv = x[0];
     for (int i = 1; i < n; i++) if (x[i] > bv) { bv = x[i]; best = i; }
     return best;
+}
+
+// Optional sampling. Greedy is the default. When SamplerCfg.temp > 0
+// the corresponding committed-token argmax sites instead run a small
+// CPU sampler chain (rep penalty -> top_k -> top_p -> temp -> draw).
+// The DDTree skeleton itself stays argmax to keep accept rate intact.
+struct SamplerCfg {
+    float    temp       = 0.0f;
+    float    top_p      = 1.0f;
+    int      top_k      = 0;
+    float    rep_pen    = 1.0f;
+    int      rep_window = 256;
+    uint64_t seed       = 0;
+};
+
+static int sample_logits(const float * logits_in,
+                         int vocab,
+                         const SamplerCfg & cfg,
+                         const std::vector<int32_t> & history,
+                         std::mt19937_64 & rng) {
+    std::vector<std::pair<float,int>> cand(vocab);
+    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
+
+    if (cfg.rep_pen > 1.0f && !history.empty()) {
+        const int win  = std::min((int)history.size(), cfg.rep_window);
+        const int from = (int)history.size() - win;
+        std::unordered_set<int> seen;
+        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
+        for (auto & c : cand) {
+            if (seen.count(c.second)) {
+                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
+                                           : c.first * cfg.rep_pen;
+            }
+        }
+    }
+
+    if (cfg.top_k > 0 && cfg.top_k < vocab) {
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
+                          [](auto & a, auto & b){ return a.first > b.first; });
+        cand.resize(cfg.top_k);
+    } else {
+        std::sort(cand.begin(), cand.end(),
+                  [](auto & a, auto & b){ return a.first > b.first; });
+    }
+
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    float maxv = cand.front().first * inv_t;
+    double Z   = 0.0;
+    std::vector<float> probs(cand.size());
+    for (size_t i = 0; i < cand.size(); i++) {
+        probs[i] = std::exp(cand[i].first * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (auto & p : probs) p = (float)(p / Z);
+
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        double cum = 0.0;
+        size_t cut = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        probs.resize(cut); cand.resize(cut);
+        double zz = 0.0;
+        for (auto p : probs) zz += p;
+        for (auto & p : probs) p = (float)(p / zz);
+    }
+
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    double r   = u(rng);
+    double acc = 0.0;
+    for (size_t i = 0; i < probs.size(); i++) {
+        acc += probs[i];
+        if (r <= acc) return cand[i].second;
+    }
+    return cand.back().second;
+}
+
+static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
+    auto pos = line.find(" samp=");
+    if (pos == std::string::npos) return false;
+    auto end = line.find(' ', pos + 1);
+    std::string tok = (end == std::string::npos)
+                          ? line.substr(pos + 6)
+                          : line.substr(pos + 6, end - (pos + 6));
+    line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
+    float t = 0.0f, tp = 1.0f, rp = 1.0f;
+    int   tk = 0;
+    unsigned long long sd = 0;
+    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
+                        &t, &tp, &tk, &rp, &sd);
+    if (n < 1) return false;
+    out.temp    = t;
+    out.top_p   = tp;
+    out.top_k   = tk;
+    out.rep_pen = rp;
+    out.seed    = sd;
+    return true;
 }
 
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
@@ -417,7 +517,8 @@ static DDTree build_ddtree(const float * top_log_probs,
 // deepest accepted node, which didn't match any of that node's children).
 static std::vector<int> follow_verified_tree(const DDTree & tree,
                                              const int32_t * posterior,
-                                             int & out_next_token) {
+                                             int & out_next_token,
+                                             int * out_node_idx = nullptr) {
     std::vector<int> accepted;
     accepted.reserve(tree.n_nodes + 1);
     accepted.push_back(0);
@@ -433,6 +534,7 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
         next_token = posterior[current_index];
     }
     out_next_token = next_token;
+    if (out_node_idx) *out_node_idx = current_index;
     return accepted;
 }
 
@@ -1069,6 +1171,9 @@ static bool build_lm_head_projection_step(
 
 // ─── Main ─────────────────────────────────────────────────────────
 
+static SamplerCfg     g_sampler;
+static std::mt19937_64 g_sampler_rng{std::random_device{}()};
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
@@ -1576,6 +1681,10 @@ int main(int argc, char ** argv) {
         if (daemon_mode) {
             std::string line;
             if (!std::getline(std::cin, line)) break;
+            g_sampler = SamplerCfg{};
+            if (parse_sampler_token(line, g_sampler) && g_sampler.seed != 0) {
+                g_sampler_rng.seed(g_sampler.seed);
+            }
 
             // ── Park/unpark commands (additive on top of latest daemon) ─────
             // "park draft" frees ~3.3GB, "park target" frees ~15GB,
@@ -2087,7 +2196,9 @@ int main(int argc, char ** argv) {
             std::vector<float> logits_buf(vocab, 0.0f);
             ggml_backend_tensor_get(lsg.logits, logits_buf.data(), 0,
                                     sizeof(float) * vocab);
-            last_tok = argmax_f32(logits_buf.data(), vocab);
+            last_tok = (g_sampler.temp > 0.0f)
+                ? sample_logits(logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
+                : argmax_f32(logits_buf.data(), vocab);
             step_graph_destroy(lsg);
         }
 
@@ -2203,7 +2314,9 @@ int main(int argc, char ** argv) {
         const size_t last_row_off = (size_t)(n_tokens - 1) * vocab * sizeof(float);
         ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), last_row_off,
                                 sizeof(float) * vocab);
-        last_tok = argmax_f32(pf_logits_buf.data(), vocab);
+        last_tok = (g_sampler.temp > 0.0f)
+            ? sample_logits(pf_logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
+            : argmax_f32(pf_logits_buf.data(), vocab);
         committed = start + n_tokens;
 
         // Fire inline snapshot after compute, so cache boundary is exact.
@@ -2623,7 +2736,15 @@ int main(int argc, char ** argv) {
 
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
-            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token);
+            int bonus_node_idx = 0;
+            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
+            if (g_sampler.temp > 0.0f) {
+                std::vector<float> bonus_logits(vocab);
+                ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
+                                        (size_t)bonus_node_idx * sg.logits->nb[1],
+                                        (size_t)vocab * sizeof(float));
+                next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
+            }
             const int accept_depth = (int)accepted.size();  // includes root
 
             // Detect when the walk takes a sibling branch (accepted node

@@ -237,7 +237,7 @@ Research proof-of-concept, not production.
 
 - **Batch size 1**, single-user local inference target (Ollama / LM Studio use case)
 - **One model pair**: Qwen3.5-27B Q4_K_M target + z-lab DFlash BF16 draft. Does not generalize without rewriting the graph builders.
-- **Greedy only**: `temperature`/`top_p` on the OpenAI server accepted but ignored. Rejection sampling in the verify path is a weekend-sized addition.
+- **Optional sampling**: `temperature`, `top_p`, `top_k`, `seed`, and `frequency_penalty` are honored on the OpenAI endpoint. The DDTree verify skeleton stays argmax (preserves accept rate); only the *committed* token at each verify step is drawn from a small CPU sampler chain (rep-pen → top-k → top-p → temp → multinomial). `temperature=0` (default) keeps the path bit-exact greedy. Full Leviathan-style rejection sampling on the tree is still a future addition.
 - **CUDA sm_86+ / sm_110 Thor** only. No Metal, ROCm, multi-GPU.
 - **Q4_K_M target** costs ~30 points of per-position accept vs the paper's BF16. Q5_K_M / Q6_K would recover most of it, if they fit.
 
@@ -247,7 +247,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 
-- **Temperature / top-k sampling** in the verify path
+- **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
 
 ## Citation

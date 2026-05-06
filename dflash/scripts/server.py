@@ -113,9 +113,10 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     stream: bool = False
     max_tokens: int = 512
-    temperature: float | None = None   # accepted, ignored (greedy-only)
-    top_p: float | None = None         # accepted, ignored
-    top_k: int | None = None           # accepted, ignored
+    temperature: float | None = None   # 0 = greedy, >0 = sample
+    seed: int | None = None             # rng seed for sampling
+    top_p: float | None = None         # nucleus, applied when temperature > 0
+    top_k: int | None = None           # top-k, applied when temperature > 0
     stop: list[str] | str | None = None  # FIX 3: accept stop field (Open WebUI sends it)
     chat_template_kwargs: dict | None = None
 
@@ -133,8 +134,22 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
+    seed: int | None = None
     stop_sequences: list[str] | None = None
     chat_template_kwargs: dict | None = None
+
+
+def _samp_suffix(req) -> str:
+    # Render ` samp=temp,top_p,top_k,rep_pen[,seed]` tail when the request asks for
+    # non-greedy decoding. Empty string keeps the daemon protocol greedy-compatible.
+    t  = float(getattr(req, "temperature", 0.0) or 0.0)
+    if t <= 0.0:
+        return ""
+    tp = float(getattr(req, "top_p", 1.0) or 1.0)
+    tk = int(getattr(req, "top_k", 0) or 0)
+    rp = float(getattr(req, "frequency_penalty", 0.0) or 0.0) + 1.0
+    seed = int(getattr(req, "seed", 0) or 0)
+    return f" samp={t:.4f},{tp:.4f},{tk},{rp:.4f},{seed}"
 
 
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
@@ -368,7 +383,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         daemon_proc.stdin.write(cmd_line.encode("utf-8"))
         daemon_proc.stdin.flush()
 
-    def _build_cmd_line(cur_bin, cur_ids, gen_len, prefix_cache,
+    def _build_cmd_line(req, cur_bin, cur_ids, gen_len, prefix_cache,
                         prompt_ids, full_snap_prep_ref: list,
                         compression_fired: bool):
         """
@@ -396,7 +411,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                 cmd_line = f"{cur_bin} {gen_len}"
             if snap_prep:
                 cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
-            return cmd_line + "\n", snap_prep
+            return cmd_line + _samp_suffix(req) + "\n", snap_prep
 
     def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
         return min(max_tokens, max_ctx - prompt_len - 20)
@@ -431,7 +446,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                             yield f"data: {json.dumps(err)}\n\n"
                             yield "data: [DONE]\n\n"
                             return
-                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
                     else:
                         cur_bin, cur_ids = await asyncio.to_thread(
                             _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -450,7 +465,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                             return
                         compression_fired = (cur_bin != prompt_bin)
                         cmd_line, snap_prep = _build_cmd_line(
-                            cur_bin, cur_ids, gen_len, prefix_cache,
+                            req, cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
 
                     # FIX 7: guard against dead daemon
@@ -525,7 +540,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     return JSONResponse(
                         {"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"},
                         status_code=400)
-                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
             else:
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -540,7 +555,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                         status_code=400)
                 compression_fired = (cur_bin != prompt_bin)
                 cmd_line, snap_prep = _build_cmd_line(
-                    cur_bin, cur_ids, gen_len, prefix_cache,
+                    req, cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
 
             try:
@@ -620,7 +635,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                                              "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}}
                             yield f"event: error\ndata: {json.dumps(err)}\n\n"
                             return
-                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
                     else:
                         cur_bin, cur_ids = await asyncio.to_thread(
                             _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -637,7 +652,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                             return
                         compression_fired = (cur_bin != prompt_bin)
                         cmd_line, snap_prep = _build_cmd_line(
-                            cur_bin, cur_ids, gen_len, prefix_cache,
+                            req, cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
 
                     message_start = {
@@ -713,7 +728,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                         {"type": "error", "error": {"type": "invalid_request_error",
                          "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
                         status_code=400)
-                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}" + _samp_suffix(req) + "\n"
             else:
                 cur_bin, cur_ids = await asyncio.to_thread(
                     _maybe_compress, raw_msgs, prompt_bin, prompt_ids,
@@ -729,7 +744,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                         status_code=400)
                 compression_fired = (cur_bin != prompt_bin)
                 cmd_line, snap_prep = _build_cmd_line(
-                    cur_bin, cur_ids, gen_len, prefix_cache,
+                    req, cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
 
             try:
