@@ -203,7 +203,7 @@ Questions, ideas, or want to see what others are building? Join the [Luce Discor
 
 ---
 
-MIT · [Lucebox](https://lucebox.com)
+Apache 2.0 · [Lucebox](https://lucebox.com)
 
 Built with [Claude](https://claude.ai)
 

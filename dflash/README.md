@@ -301,7 +301,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 
 ---
 
-MIT · [Lucebox](https://lucebox.com) · [Discord](https://discord.gg/yHfswqZmJQ)
+Apache 2.0 · [Lucebox](https://lucebox.com) · [Discord](https://discord.gg/yHfswqZmJQ)
 
 Inspired by [z-lab/DFlash](https://arxiv.org/abs/2602.06036), [liranringel/ddtree](https://github.com/liranringel/ddtree), [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 l-org/llama.cpp](https://github.com/ggml-org/llama.cpp).

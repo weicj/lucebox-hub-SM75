@@ -82,4 +82,4 @@ If you want to contribute benchmarks but don't have the hardware:
 
 ## Licensing
 
-By contributing you agree your work is MIT-licensed, same as the rest of the repo.
+By contributing you agree your work is licensed under the Apache License, Version 2.0, same as the rest of the repo (see `LICENSE`). Historical contributions before the relicense remain available under their original MIT terms in the git history.
