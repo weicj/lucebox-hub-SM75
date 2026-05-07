@@ -159,6 +159,8 @@ static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
     return true;
 }
 
+// laguna_serve.py + laguna_pflash_niah.py write prompts as a uint32 length
+// prefix followed by N int32 token IDs. Used by the legacy `generate` path.
 static std::vector<int32_t> read_counted_i32(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
@@ -168,6 +170,23 @@ static std::vector<int32_t> read_counted_i32(const std::string & path) {
     std::vector<int32_t> ids((size_t)n);
     if (n > 0) {
         f.read(reinterpret_cast<char *>(ids.data()), (std::streamsize)ids.size() * sizeof(int32_t));
+        if (!f) return {};
+    }
+    return ids;
+}
+
+// scripts/server.py writes prompts as a raw int32 stream (no length prefix);
+// the file size implies the token count. Used by the bare-prompt path so the
+// daemon stays drop-in for the qwen35 server.py protocol.
+static std::vector<int32_t> read_uncounted_i32(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const auto sz = (size_t)f.tellg();
+    f.seekg(0);
+    std::vector<int32_t> ids(sz / sizeof(int32_t));
+    if (!ids.empty()) {
+        f.read(reinterpret_cast<char *>(ids.data()),
+               (std::streamsize)ids.size() * sizeof(int32_t));
         if (!f) return {};
     }
     return ids;
@@ -484,6 +503,10 @@ int main(int argc, char ** argv) {
         if (looks_like_path(cmd)) {
             // Bare-prompt server.py-style path: `<prompt_bin> <gen_len>`.
             // Tokens stream as int32 LE on stream_fd, terminated by -1.
+            // server.py writes prompt_bin as a raw int32 stream (no length
+            // prefix), so use read_uncounted_i32 here — the legacy `generate`
+            // path above uses read_counted_i32 for the niah/laguna_serve
+            // counted-i32 format.
             const std::string & in_path = cmd;
             int n_gen = 0;
             iss >> n_gen;
@@ -498,7 +521,7 @@ int main(int argc, char ** argv) {
                 std::printf("err no_stream_fd\n"); std::fflush(stdout);
                 continue;
             }
-            auto prompt = read_counted_i32(in_path);
+            auto prompt = read_uncounted_i32(in_path);
             if (prompt.empty()) {
                 std::printf("err empty_prompt\n"); std::fflush(stdout);
                 emit_int32(-1);

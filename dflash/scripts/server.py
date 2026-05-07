@@ -46,8 +46,16 @@ DEFAULT_TARGET = Path(os.environ.get(
 ))
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
+DEFAULT_LAGUNA_BIN = ROOT / "build" / ("test_laguna_daemon" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
+
+# Architecture strings stored in `general.architecture` of every GGUF this
+# server can drive. The qwen35 path (test_dflash + DFlash + DDTree) is the
+# canonical one; laguna is a hand-rolled MoE target served by the simpler
+# test_laguna_daemon binary (no spec-decode, no DDTree).
+_QWEN35_ARCHES = {"qwen35", "qwen36"}
+_LAGUNA_ARCHES  = {"laguna"}
 
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})
 
@@ -63,25 +71,58 @@ _QWEN35_FAMILY_TOKENIZERS = {
     "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
 }
 
+_LAGUNA_FAMILY_TOKENIZERS = {
+    "Laguna-XS.2": "poolside/Laguna-XS.2",
+    "Laguna-XS":   "poolside/Laguna-XS.2",
+    "laguna-xs2":  "poolside/Laguna-XS.2",
+}
+
+
+def _read_gguf_str(reader, key: str) -> str | None:
+    f = reader.fields.get(key)
+    if f is None or not f.data:
+        return None
+    import numpy as np
+    p = f.parts[f.data[0]]
+    if not isinstance(p, np.ndarray):
+        return None
+    try:
+        return bytes(p).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _arch_from_gguf(gguf_path: Path) -> str:
+    """Return the value of ``general.architecture`` from the GGUF, or 'unknown'.
+
+    server.py uses this to dispatch between the qwen35 stack (test_dflash +
+    DFlash + DDTree) and the laguna stack (test_laguna_daemon, autoregressive
+    only). 'unknown' falls back to the qwen35 path so existing setups keep
+    working when the field is missing.
+    """
+    try:
+        from gguf import GGUFReader  # type: ignore
+        r = GGUFReader(str(gguf_path))
+        v = _read_gguf_str(r, "general.architecture")
+        return v.lower() if v else "unknown"
+    except Exception:
+        return "unknown"
+
 
 def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
     default = "Qwen/Qwen3.5-27B"
     try:
         from gguf import GGUFReader  # type: ignore
         r = GGUFReader(str(gguf_path))
+        arch = (_read_gguf_str(r, "general.architecture") or "").lower()
+        family = _LAGUNA_FAMILY_TOKENIZERS if arch in _LAGUNA_ARCHES else _QWEN35_FAMILY_TOKENIZERS
+        if arch in _LAGUNA_ARCHES:
+            default = next(iter(_LAGUNA_FAMILY_TOKENIZERS.values()))
         for key in ("general.basename", "general.name"):
-            f = r.fields.get(key)
-            if f is None or not f.data:
+            val = _read_gguf_str(r, key)
+            if val is None:
                 continue
-            import numpy as np
-            p = f.parts[f.data[0]]
-            if not isinstance(p, np.ndarray):
-                continue
-            try:
-                val = bytes(p).decode("utf-8", errors="replace")
-            except Exception:
-                continue
-            for known, repo in _QWEN35_FAMILY_TOKENIZERS.items():
+            for known, repo in family.items():
                 if known.lower() in val.lower():
                     return repo
     except Exception:
@@ -154,12 +195,13 @@ def _samp_suffix(req) -> str:
     return f" samp={t:.4f},{tp:.4f},{tk},{rp:.4f},{seed}"
 
 
-def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
+def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max_ctx: int,
               tokenizer: AutoTokenizer, stop_ids: set[int],
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
-              prefill_cache_slots: int = 4) -> FastAPI:
+              prefill_cache_slots: int = 4,
+              arch: str = "qwen35") -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
 
@@ -189,10 +231,27 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
 
-    cmd = [bin_abs, str(target), str(draft), "--daemon",
-           "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-           f"--max-ctx={max_ctx}",
-           f"--stream-fd={stream_fd_val}"]
+    if arch in _LAGUNA_ARCHES:
+        # test_laguna_daemon: no spec-decode, no DDTree. Just the target +
+        # KV-cache config + stream-fd. Tokens stream as int32 LE on the fd,
+        # terminated by a -1 sentinel, exactly matching what the qwen35
+        # daemon emits, so the SSE/stream consumers below stay unchanged.
+        kv_t = os.environ.get("DFLASH27B_KV_K", "q8_0")
+        chunk_env = os.environ.get("DFLASH27B_LAGUNA_CHUNK", "2048")
+        # test_laguna_daemon's argv parser uses space-separated flags for
+        # --max-ctx / --kv / --chunk; --stream-fd accepts both forms.
+        cmd = [bin_abs, str(target),
+               "--max-ctx", str(max_ctx),
+               "--kv",      kv_t,
+               "--chunk",   chunk_env,
+               f"--stream-fd={stream_fd_val}"]
+    else:
+        if draft is None:
+            raise SystemExit("qwen35 arch requires --draft model.safetensors")
+        cmd = [bin_abs, str(target), str(draft), "--daemon",
+               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}"]
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
                                        stdin=subprocess.PIPE,
@@ -834,13 +893,49 @@ def main():
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
 
-    if not args.bin.is_file():
-        raise SystemExit(f"binary not found at {args.bin}")
     if not args.target.is_file():
         raise SystemExit(f"target GGUF not found at {args.target}")
-    draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
-    if not draft.is_file():
-        raise SystemExit(f"draft safetensors not found at {args.draft}")
+
+    # Architecture dispatch: read general.architecture from the GGUF and
+    # pick the matching daemon binary + flags. laguna gets test_laguna_daemon
+    # (no spec-decode), qwen35/qwen36 gets test_dflash. The user can still
+    # override args.bin explicitly to force a specific binary.
+    arch = _arch_from_gguf(args.target)
+    user_bin = (args.bin != DEFAULT_BIN)
+    if arch in _LAGUNA_ARCHES and not user_bin:
+        args.bin = DEFAULT_LAGUNA_BIN
+
+    if not args.bin.is_file():
+        raise SystemExit(f"binary not found at {args.bin} (arch={arch})")
+
+    if arch in _LAGUNA_ARCHES:
+        # No DFlash draft model exists for laguna yet; the binary takes
+        # only the target weights. Prefix caching also requires SNAPSHOT/
+        # RESTORE in test_laguna_daemon (Phase 2b, not yet shipped), so
+        # disable both caches here — every request runs a cold prefill.
+        draft = None
+        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
+            print(f"[server] laguna: prefix/prefill cache slots disabled "
+                  f"(SNAPSHOT/RESTORE not yet implemented in test_laguna_daemon)",
+                  flush=True)
+        args.prefix_cache_slots = 0
+        args.prefill_cache_slots = 0
+        if prefill_cfg.enabled:
+            print("[server] laguna: in-process PFlash compression not yet "
+                  "wired through this path (sidecar pflash_daemon planned); "
+                  "running uncompressed.", flush=True)
+            prefill_cfg = config_from_args(
+                argparse.Namespace(
+                    prefill_compression="off",
+                    prefill_threshold=args.prefill_threshold,
+                    prefill_keep_ratio=args.prefill_keep_ratio,
+                    prefill_drafter=args.prefill_drafter,
+                    prefill_drafter_tokenizer=args.prefill_drafter_tokenizer,
+                ))
+    else:
+        draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
+        if not draft.is_file():
+            raise SystemExit(f"draft safetensors not found at {args.draft}")
 
     tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
@@ -859,10 +954,12 @@ def main():
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
-                    prefill_cache_slots=args.prefill_cache_slots)
+                    prefill_cache_slots=args.prefill_cache_slots,
+                    arch=arch)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
+    print(f"  arch      = {arch}")
     print(f"  target    = {args.target}")
     print(f"  draft     = {draft}")
     print(f"  bin       = {args.bin}")
