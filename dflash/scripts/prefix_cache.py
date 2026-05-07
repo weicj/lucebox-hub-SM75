@@ -295,7 +295,19 @@ class PrefixCache:
 
         self.entries: OrderedDict[bytes, int] = OrderedDict()  # hash → slot_id
         self.next_slot = 0
-        self.im_end, self.im_start, self.system_t = _qwen_marker_ids(tokenizer)
+        try:
+            self.im_end, self.im_start, self.system_t = _qwen_marker_ids(tokenizer)
+        except ValueError as e:
+            # Tokenizers without single-token <|im_end|> / <|im_start|>
+            # markers (e.g. Poolside Laguna-XS.2 byte-level BPE) cannot use
+            # this Qwen-style boundary detector. Disable the cache cleanly
+            # instead of crashing the server. The daemon-side SNAPSHOT /
+            # RESTORE machinery stays available; a Laguna-aware boundary
+            # detector is the missing piece to make the cache useful here.
+            print(f"{log_prefix} disabling: {e}", flush=True)
+            self.disabled = True
+            self.cap     = 0
+            return
         # Pending eviction: set by prepare_inline_snap when at cap; the old
         # entry is NOT removed until confirm_inline_snap succeeds.  This ensures
         # that if the request aborts before confirm runs, the old entry survives

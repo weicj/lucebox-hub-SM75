@@ -163,6 +163,41 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
 void free_laguna_target_cache(LagunaTargetCache & c);
 void reset_laguna_target_cache(LagunaTargetCache & c);
 
+// ----------------------------------------------------------------------------
+// Cache snapshots for prefix-cache slots (server.py'́s PrefixCache).
+//
+// A snapshot holds a parallel set of K/V tensors with the same shapes and
+// dtypes as the live LagunaTargetCache, plus the cur_pos at which the
+// snapshot was taken. SNAPSHOT performs a device-to-device copy of every
+// per-layer K and V tensor from the live cache into the snapshot buffer;
+// RESTORE does the reverse and resets cur_pos. The buffers are allocated
+// lazily on first SNAPSHOT and freed on FREE_SNAPSHOT.
+// ----------------------------------------------------------------------------
+struct LagunaCacheSnapshot {
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
+    std::vector<ggml_tensor *> attn_k;  // size = n_layer
+    std::vector<ggml_tensor *> attn_v;  // size = n_layer
+    int                   cur_pos = 0;
+    bool                  used    = false;
+};
+
+bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
+                            ggml_backend_t            backend,
+                            int                       n_layer,
+                            int                       max_ctx,
+                            int                       n_head_kv,
+                            int                       head_dim,
+                            LagunaCacheSnapshot &     out);
+
+void laguna_snapshot_free(LagunaCacheSnapshot & snap);
+
+bool laguna_snapshot_save(const LagunaTargetCache & cache,
+                           LagunaCacheSnapshot &     snap);
+
+bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,
+                              LagunaTargetCache &         cache);
+
 struct LagunaGraphInputs {
     ggml_tensor * inp_embed;      // [n_embd, n_tokens, 1] f32 (CPU-embedded by caller)
     ggml_tensor * positions;      // [n_tokens] i32 (NeoX rope; not M-RoPE)

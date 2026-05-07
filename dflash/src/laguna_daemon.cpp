@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <array>
 #include <random>
 #include <sstream>
 #include <string>
@@ -179,6 +180,30 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
         (void)n;
     };
 
+    // Prefix-cache slots. Lazy-allocated on first SNAPSHOT into the slot;
+    // server.py PrefixCache caps at DAEMON_MAX_SLOTS=8 so we mirror that.
+    static constexpr int kMaxSlots = 8;
+    std::array<LagunaCacheSnapshot, kMaxSlots> snapshots{};
+    auto ensure_slot = [&](int slot) -> bool {
+        if (slot < 0 || slot >= kMaxSlots) {
+            std::fprintf(stderr, "[snap] slot=%d out of range\n", slot);
+            return false;
+        }
+        if (target_parked) {
+            std::fprintf(stderr, "[snap] target parked, cannot allocate snapshot\n");
+            return false;
+        }
+        if (!snapshots[slot].ctx) {
+            if (!laguna_snapshot_alloc(cache, backend, w.n_layer, args.max_ctx,
+                                        w.n_head_kv, w.head_dim, snapshots[slot])) {
+                std::fprintf(stderr, "[snap] alloc slot=%d: %s\n", slot,
+                              dflash27b_last_error());
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto run_prompt = [&](const std::vector<int32_t> & prompt,
                           int n_gen,
                           const SamplerCfg & sampler,
@@ -282,6 +307,31 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
             stream_emit(-1);
             continue;
         }
+        if (starts_with(line, "SNAPSHOT ")) {
+            int slot = std::atoi(line.c_str() + 9);
+            if (!ensure_slot(slot)) { stream_emit(-1); continue; }
+            if (!laguna_snapshot_save(cache, snapshots[slot])) {
+                std::fprintf(stderr, "[snap] save slot=%d: %s\n",
+                              slot, dflash27b_last_error());
+                stream_emit(-1); continue;
+            }
+            std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                         slot, snapshots[slot].cur_pos);
+            std::fflush(stdout);
+            stream_emit(-1);
+            continue;
+        }
+        if (starts_with(line, "FREE_SNAPSHOT ")) {
+            int slot = std::atoi(line.c_str() + 14);
+            if (slot >= 0 && slot < kMaxSlots) {
+                laguna_snapshot_free(snapshots[slot]);
+                std::printf("[snap] freed slot=%d\n", slot);
+                std::fflush(stdout);
+            }
+            stream_emit(-1);
+            continue;
+        }
+
         if (line == "free drafter" || line == "drafter free") {
             if (drafter_loaded) {
                 free_drafter(drafter_ctx);
@@ -389,10 +439,127 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
             continue;
         }
 
+        // ---- RESTORE: load slot KV, prefill prompt tail, decode ---------
+        if (cmd == "RESTORE") {
+            int slot = -1;
+            std::string in_path;
+            int n_gen = 0;
+            iss >> slot >> in_path >> n_gen;
+            if (slot < 0 || slot >= kMaxSlots || in_path.empty() || n_gen <= 0) {
+                std::fprintf(stderr, "[snap] RESTORE bad args: %s\n", line.c_str());
+                std::printf("err bad_args\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            if (!snapshots[slot].used) {
+                std::fprintf(stderr, "[snap] RESTORE slot=%d not populated\n", slot);
+                std::printf("err empty_slot\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            if (!laguna_snapshot_restore(snapshots[slot], cache)) {
+                std::fprintf(stderr, "[snap] RESTORE slot=%d: %s\n",
+                              slot, dflash27b_last_error());
+                std::printf("err restore\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            const int prefix_len = cache.cur_pos;
+            auto prompt_full = read_uncounted_i32(in_path);
+            if ((int)prompt_full.size() < prefix_len) {
+                std::fprintf(stderr, "[snap] RESTORE prompt shorter than cached prefix (%zu < %d)\n",
+                              prompt_full.size(), prefix_len);
+                std::printf("err prefix_shorter\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            // Run on the diff only (tokens past the cached prefix). When the
+            // diff is empty (cache covers the whole prompt) we still need to
+            // pull last-token logits, so synthesize a 1-token decode call by
+            // re-running the very last cached token through laguna_step. To
+            // keep things simple here we drop the last cached token and
+            // re-prefill it together with the diff: cur_pos becomes
+            // prefix_len-1 and we forward prompt_full[prefix_len-1:].
+            int N = (int)prompt_full.size();
+            if (prefix_len == N) {
+                if (prefix_len <= 0) {
+                    std::printf("err empty_diff\n"); std::fflush(stdout);
+                    stream_emit(-1); continue;
+                }
+                cache.cur_pos = prefix_len - 1;
+            }
+            const int kv_start = cache.cur_pos;
+            const int diff_n   = N - kv_start;
+            std::vector<float> embed_diff((size_t)diff_n * w.n_embd);
+            if (!w.embedder.embed(prompt_full.data() + kv_start, diff_n, embed_diff.data())) {
+                std::printf("err embed_prefill\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            std::vector<float> last_logits;
+            bool ok = true;
+            const int n_chunks = (diff_n + args.chunk - 1) / args.chunk;
+            for (int c = 0; c < n_chunks && ok; ++c) {
+                const int off    = c * args.chunk;
+                const int n_tok  = std::min(args.chunk, diff_n - off);
+                const int starts = kv_start + off;
+                ok = laguna_step(backend, w, cache,
+                                  embed_diff.data() + (size_t)off * w.n_embd,
+                                  n_tok, starts, no_mask, last_logits);
+            }
+            if (!ok) {
+                std::printf("err prefill\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
+            std::vector<int32_t> history(prompt_full);
+            auto argmax = [](const std::vector<float> & ll) {
+                int best = 0; float bv = ll[0];
+                for (size_t i = 1; i < ll.size(); ++i)
+                    if (ll[i] > bv) { bv = ll[i]; best = (int)i; }
+                return best;
+            };
+            auto pick = [&](const std::vector<float> & ll) {
+                return do_sample
+                    ? sample_logits(ll.data(), (int)ll.size(), sampler, history, sampler_rng)
+                    : argmax(ll);
+            };
+            int next_tok = pick(last_logits);
+            int generated = 0;
+            std::vector<float> embed_step((size_t)w.n_embd);
+            for (int s = 0; s < n_gen; ++s) {
+                if (next_tok == w.eos_id || next_tok == w.eos_chat_id) break;
+                history.push_back(next_tok);
+                stream_emit(next_tok);
+                ++generated;
+                if (!w.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
+                std::vector<float> step_logits;
+                if (!laguna_step(backend, w, cache, embed_step.data(), 1,
+                                  cache.cur_pos, no_mask, step_logits)) { ok = false; break; }
+                next_tok = pick(step_logits);
+            }
+            stream_emit(-1);
+            std::printf("ok N=%d gen=%d prefix_len=%d (RESTORE slot=%d) stream_fd=%d\n",
+                         N, generated, prefix_len, slot, stream_fd);
+            std::fflush(stdout);
+            continue;
+        }
+
         if (looks_like_path(cmd)) {
             const std::string & in_path = cmd;
             int n_gen = 0;
             iss >> n_gen;
+            // Optional inline snap tail: ` snap=<L>:<slot>`. After the prompt
+            // is fully prefilled, snapshot the cache at cur_pos=L into the
+            // given slot. server.py'́s PrefixCache uses this to register a
+            // mid-prompt prefix it can RESTORE from on later turns.
+            int inline_snap_pos  = -1;
+            int inline_snap_slot = -1;
+            {
+                size_t p = line.find(" snap=");
+                if (p != std::string::npos) {
+                    int L = -1, S = -1;
+                    if (std::sscanf(line.c_str() + p + 6, "%d:%d", &L, &S) == 2 &&
+                        L > 0 && S >= 0 && S < kMaxSlots) {
+                        inline_snap_pos  = L;
+                        inline_snap_slot = S;
+                    }
+                }
+            }
             if (n_gen <= 0) {
                 std::fprintf(stderr, "[laguna-daemon] bad: %s\n", line.c_str());
                 std::printf("err bad_args\n"); std::fflush(stdout);
@@ -423,6 +590,22 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
                         (int)prompt.size(), generated.size(), pf_s, g_s,
                         generated.size() / std::max(1e-9, g_s), stream_fd);
             std::fflush(stdout);
+            // Inline snapshot: register the first inline_snap_pos tokens of
+            // the just-prefilled cache so a later request can RESTORE this
+            // prefix. We snapshot the WHOLE buffer (one device-to-device
+            // copy) but set snap.cur_pos = L; the surplus rows beyond L are
+            // never read because RESTORE trims cur_pos back to L and any
+            // subsequent forward overwrites them.
+            if (inline_snap_slot >= 0 && inline_snap_pos > 0 &&
+                inline_snap_pos <= (int)prompt.size()) {
+                if (ensure_slot(inline_snap_slot) &&
+                    laguna_snapshot_save(cache, snapshots[inline_snap_slot])) {
+                    snapshots[inline_snap_slot].cur_pos = inline_snap_pos;
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                                 inline_snap_slot, inline_snap_pos);
+                    std::fflush(stdout);
+                }
+            }
             continue;
         }
 
@@ -431,6 +614,7 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
         emit_int32(-1);
     }
 
+    for (auto & snap : snapshots) laguna_snapshot_free(snap);
     if (drafter_loaded) free_drafter(drafter_ctx);
     if (!target_parked) {
         free_laguna_target_cache(cache);

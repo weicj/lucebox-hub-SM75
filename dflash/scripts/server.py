@@ -905,20 +905,10 @@ def main():
         # No DFlash draft model exists for laguna yet; test_dflash'́s
         # internal arch dispatch reads general.architecture, accepts the
         # no-draft argv layout, and routes to run_laguna_daemon(). PFlash
-        # speculative-prefill compression IS wired through the laguna
-        # daemon (drafter co-hosted, same `compress` / `park target` /
-        # `unpark target` / `free drafter` protocol the qwen35 stack
-        # uses), so --prefill-compression auto/always works on this path.
+        # compression and prefix-cache SNAPSHOT/RESTORE are both wired
+        # through the laguna daemon now, so --prefill-compression and
+        # --prefix-cache-slots behave the same as on the qwen35 path.
         draft = None
-        # Prefix caching still requires SNAPSHOT/RESTORE in the laguna
-        # daemon (follow-up work). Force the slots to 0 so PrefixCache
-        # short-circuits to the bare-prompt path on every request.
-        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
-            print("[server] laguna: prefix/prefill cache slots disabled "
-                  "(SNAPSHOT/RESTORE not yet implemented in run_laguna_daemon)",
-                  flush=True)
-        args.prefix_cache_slots = 0
-        args.prefill_cache_slots = 0
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():
