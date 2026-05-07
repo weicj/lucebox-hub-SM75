@@ -23,87 +23,11 @@
 
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-#include "ggml-alloc.h"
 
 using namespace dflash27b;
 
-// Build + run a single forward step (n_tokens=1 typically) at the given
-// kv_start, returns the last-token logits via host vector. Used for both
-// prefill (multi-token first call) and per-token decode (n_tok=1).
-static bool laguna_step_logits(
-    ggml_backend_t backend,
-    const LagunaTargetWeights & w,
-    LagunaTargetCache & cache,
-    const float * embed,        // [n_tok, n_embd] f32
-    int n_tok,
-    int kv_start,
-    bool no_mask,
-    std::vector<float> & out_logits)
-{
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
-    ip.no_alloc = true;
-    ggml_context * ctx = ggml_init(ip);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
-
-    ggml_tensor * ie = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w.n_embd, n_tok, 1);
-    ggml_set_input(ie);
-    ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
-    ggml_set_input(pp);
-    ggml_tensor * mk = nullptr, * mkc = nullptr;
-    if (!no_mask && n_tok > 1) {
-        const int kv_len = kv_start + n_tok;
-        mk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
-        ggml_set_input(mk);
-        mkc = ggml_cast(ctx, mk, GGML_TYPE_F16);
-    }
-
-    LagunaGraphInputs gi{};
-    gi.inp_embed       = ie;
-    gi.positions       = pp;
-    gi.attn_mask       = mkc;
-    gi.n_tokens        = n_tok;
-    gi.kv_start        = kv_start;
-    gi.output_logits   = true;
-    gi.output_last_only= true;
-
-    LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
-
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        std::fprintf(stderr, "gallocr_alloc step n_tok=%d failed\n", n_tok);
-        ggml_gallocr_free(galloc); ggml_free(ctx); return false;
-    }
-
-    ggml_backend_tensor_set(ie, embed, 0, (size_t)n_tok * w.n_embd * sizeof(float));
-    std::vector<int32_t> pos(n_tok);
-    for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
-    ggml_backend_tensor_set(pp, pos.data(), 0, pos.size() * sizeof(int32_t));
-    if (mk) {
-        const int kv_len = kv_start + n_tok;
-        std::vector<float> mb((size_t)kv_len * n_tok, 0.0f);
-        for (int t = 0; t < n_tok; ++t) {
-            const int abs_q = kv_start + t;
-            for (int j = 0; j < kv_len; ++j) {
-                if (j > abs_q) mb[(size_t)t * kv_len + j] = -INFINITY;
-            }
-        }
-        ggml_backend_tensor_set(mk, mb.data(), 0, mb.size() * sizeof(float));
-    }
-
-    ggml_status st = ggml_backend_graph_compute(backend, gf);
-    ggml_backend_synchronize(backend);
-    if (st != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(galloc); ggml_free(ctx); return false;
-    }
-    cache.cur_pos = kv_start + n_tok;
-
-    const int64_t vocab = go.logits->ne[0];
-    out_logits.resize((size_t)vocab);
-    ggml_backend_tensor_get(go.logits, out_logits.data(), 0, out_logits.size() * sizeof(float));
-    ggml_gallocr_free(galloc); ggml_free(ctx);
-    return true;
-}
+// Forward step lives in src/laguna_target_graph.cpp::laguna_step(). The
+// bench just times prefill + decode loops on top of it.
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -153,7 +77,7 @@ int main(int argc, char ** argv) {
 
     auto t_pf0 = std::chrono::steady_clock::now();
     std::vector<float> last_logits;
-    if (!laguna_step_logits(backend, w, cache, embed_pf.data(), prompt_N, 0, no_mask, last_logits)) {
+    if (!laguna_step(backend, w, cache, embed_pf.data(), prompt_N, 0, no_mask, last_logits)) {
         std::fprintf(stderr, "prefill failed\n");
         free_laguna_target_cache(cache); free_laguna_target_weights(w); ggml_backend_free(backend); return 1;
     }
@@ -186,8 +110,8 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "embed step %d (id=%d) failed\n", s, next_tok); break;
         }
         std::vector<float> step_logits;
-        if (!laguna_step_logits(backend, w, cache, embed_step.data(), 1, cache.cur_pos,
-                                  no_mask, step_logits)) {
+        if (!laguna_step(backend, w, cache, embed_step.data(), 1, cache.cur_pos,
+                          no_mask, step_logits)) {
             std::fprintf(stderr, "decode step %d failed\n", s); break;
         }
         next_tok = argmax(step_logits);

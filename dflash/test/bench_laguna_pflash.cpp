@@ -26,15 +26,16 @@
 
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-#include "ggml-alloc.h"
 
 using namespace dflash27b;
 
-static ggml_status laguna_chunked_prefill(
+// Chunked prefill loop on top of the shared laguna_step() helper. Reports
+// total prefill time and the argmax / logit at the LAST chunk.
+static bool laguna_chunked_prefill(
     ggml_backend_t backend,
     const LagunaTargetWeights & w,
     LagunaTargetCache & cache,
-    const std::vector<float> & embed_full,   // [n_tokens, n_embd]
+    const std::vector<float> & embed_full,
     int n_tokens,
     int chunk,
     bool no_mask,
@@ -46,94 +47,30 @@ static ggml_status laguna_chunked_prefill(
     *out_argmax = -1;
     *out_logit  = 0.0f;
     const int n_chunks = (n_tokens + chunk - 1) / chunk;
-    ggml_gallocr_t galloc = nullptr;
-
+    std::vector<float> last_logits, scratch;
     for (int c = 0; c < n_chunks; ++c) {
         const int kv_start = c * chunk;
         const int n_tok    = std::min(chunk, n_tokens - c * chunk);
-        const bool last    = (c == n_chunks - 1);
-
-        ggml_init_params ip{};
-        ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
-        ip.no_alloc = true;
-        ggml_context * ctx = ggml_init(ip);
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
-
-        ggml_tensor * ie = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w.n_embd, n_tok, 1);
-        ggml_set_input(ie);
-        ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
-        ggml_set_input(pp);
-        ggml_tensor * mk = nullptr, * mkc = nullptr;
-        if (!no_mask && n_tok > 1) {
-            const int kv_len = kv_start + n_tok;
-            mk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
-            ggml_set_input(mk);
-            mkc = ggml_cast(ctx, mk, GGML_TYPE_F16);
-        }
-
-        LagunaGraphInputs gi{};
-        gi.inp_embed       = ie;
-        gi.positions       = pp;
-        gi.attn_mask       = mkc;
-        gi.n_tokens        = n_tok;
-        gi.kv_start        = kv_start;
-        gi.output_logits   = last;
-        gi.output_last_only= last;
-
-        LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
-
-        if (!galloc) galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-            std::fprintf(stderr, "gallocr_alloc chunk=%d failed\n", c);
-            ggml_free(ctx); if (galloc) ggml_gallocr_free(galloc);
-            return GGML_STATUS_FAILED;
-        }
-
-        ggml_backend_tensor_set(ie, embed_full.data() + (size_t)kv_start * w.n_embd,
-                                 0, (size_t)n_tok * w.n_embd * sizeof(float));
-        std::vector<int32_t> ppos(n_tok);
-        for (int i = 0; i < n_tok; ++i) ppos[i] = kv_start + i;
-        ggml_backend_tensor_set(pp, ppos.data(), 0, ppos.size() * sizeof(int32_t));
-        if (mk) {
-            const int kv_len = kv_start + n_tok;
-            std::vector<float> mb((size_t)kv_len * n_tok, 0.0f);
-            for (int t = 0; t < n_tok; ++t) {
-                const int abs_q = kv_start + t;
-                for (int j = 0; j < kv_len; ++j) {
-                    if (j > abs_q) mb[(size_t)t * kv_len + j] = -INFINITY;
-                }
-            }
-            ggml_backend_tensor_set(mk, mb.data(), 0, mb.size() * sizeof(float));
-        }
-
-        if (c == 0) {
-            ggml_backend_graph_compute(backend, gf);  // warm
-            ggml_backend_synchronize(backend);
-        }
+        std::vector<float> & sink = (c == n_chunks - 1) ? last_logits : scratch;
         auto tA = std::chrono::steady_clock::now();
-        ggml_status st = ggml_backend_graph_compute(backend, gf);
-        ggml_backend_synchronize(backend);
+        if (!laguna_step(backend, w, cache,
+                          embed_full.data() + (size_t)kv_start * w.n_embd,
+                          n_tok, kv_start, no_mask, sink)) {
+            std::fprintf(stderr, "laguna_step chunk=%d failed\n", c);
+            return false;
+        }
         auto tB = std::chrono::steady_clock::now();
-        if (st != GGML_STATUS_SUCCESS) {
-            ggml_free(ctx); if (galloc) ggml_gallocr_free(galloc);
-            return st;
-        }
-        cache.cur_pos = kv_start + n_tok;
         *out_pf_s += std::chrono::duration<double>(tB - tA).count();
-
-        if (last && go.logits) {
-            const int64_t vocab = go.logits->ne[0];
-            std::vector<float> ll((size_t)vocab);
-            ggml_backend_tensor_get(go.logits, ll.data(), 0, ll.size() * sizeof(float));
-            int best = 0; float bv = ll[0];
-            for (int i = 0; i < (int)vocab; ++i) if (ll[i] > bv) { bv = ll[i]; best = i; }
-            *out_argmax = best;
-            *out_logit  = bv;
-        }
-        ggml_free(ctx);
     }
-    if (galloc) ggml_gallocr_free(galloc);
-    return GGML_STATUS_SUCCESS;
+    if (!last_logits.empty()) {
+        int best = 0; float bv = last_logits[0];
+        for (size_t i = 1; i < last_logits.size(); ++i) {
+            if (last_logits[i] > bv) { bv = last_logits[i]; best = (int)i; }
+        }
+        *out_argmax = best;
+        *out_logit  = bv;
+    }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -221,15 +158,14 @@ int main(int argc, char ** argv) {
     const int chunk = std::min(M, chunk_arg);
     double tgt_s = 0.0; int argmax = 0; float logit = 0.0f;
     auto tt0 = std::chrono::steady_clock::now();
-    ggml_status st = laguna_chunked_prefill(backend, w, cache, embed_full,
-                                              M, chunk, no_mask,
-                                              &tgt_s, &argmax, &logit);
-    auto tt1 = std::chrono::steady_clock::now();
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "laguna prefill failed status=%d\n", (int)st);
-        free_laguna_target_cache(cache); free_laguna_target_weights(w); free_drafter(drafter);
+    if (!laguna_chunked_prefill(backend, w, cache, embed_full,
+                                 M, chunk, no_mask,
+                                 &tgt_s, &argmax, &logit)) {
+        std::fprintf(stderr, "laguna prefill failed\n");
+        free_laguna_target_cache(cache); free_laguna_target_weights(w);
         return 1;
     }
+    auto tt1 = std::chrono::steady_clock::now();
     const double tgt_total_s = std::chrono::duration<double>(tt1 - tt0).count();
     const double total_ttft  = drafter_s + tgt_s;
 
