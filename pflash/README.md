@@ -312,6 +312,6 @@ caching artefacts.
 
 ---
 
-MIT · [Lucebox](https://lucebox.com) · [Discord](https://discord.gg/yHfswqZmJQ)
+Apache 2.0 · [Lucebox](https://lucebox.com) · [Discord](https://discord.gg/yHfswqZmJQ)
 
 Inspired by [Jingyu6/speculative_prefill](https://github.com/Jingyu6/speculative_prefill), [qhfan/FlashPrefill](https://github.com/qhfan/FlashPrefill), [z-lab/DFlash](https://arxiv.org/abs/2602.06036).
