@@ -277,8 +277,13 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
+
+        Thinking is disabled by default (enable_thinking=False) because Qwen3.6's
+        think mode wrecks DFlash acceptance rates. Clients can opt in by sending
+        ``"chat_template_kwargs": {"enable_thinking": true}`` in the request.
         """
-        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
+        tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True,
+                            "enable_thinking": False}
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
