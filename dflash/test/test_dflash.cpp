@@ -2741,8 +2741,12 @@ int main(int argc, char ** argv) {
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
                 // headroom on a 24 GB card. Restore after scoring.
-                bool restore_target = !target_parked;
-                bool restore_draft  = !draft_parked;
+                // On >=32 GB GPUs, DFLASH_COMPRESS_NO_PARK=1 skips parking
+                // so the scorer stays co-resident with target+draft.
+                const bool no_park = (std::getenv("DFLASH_COMPRESS_NO_PARK") &&
+                                      std::atoi(std::getenv("DFLASH_COMPRESS_NO_PARK")) != 0);
+                bool restore_target = !target_parked && !no_park;
+                bool restore_draft  = !draft_parked && !no_park;
                 if (restore_target) {
                     step_graph_destroy(proj_sg);
                     free_target_weights(w);

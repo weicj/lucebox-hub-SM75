@@ -315,6 +315,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=long_text,
+            skip_park=prefill_cfg.skip_park,
         )
 
         new_msgs = list(msgs)
@@ -833,6 +834,8 @@ def main():
         os.environ.setdefault("DFLASH27B_FA_WINDOW", "0")
         os.environ.setdefault("DFLASH_FP_USE_BSA", "1")
         os.environ.setdefault("DFLASH_FP_ALPHA",   "0.85")
+        if prefill_cfg.skip_park:
+            os.environ["DFLASH_COMPRESS_NO_PARK"] = "1"
 
     if not args.bin.is_file():
         raise SystemExit(f"binary not found at {args.bin}")
