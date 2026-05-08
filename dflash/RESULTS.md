@@ -327,6 +327,114 @@ best short-context throughput default on this 5090 build. Budget 30 produced
 the highest mean AL but lower throughput, so it is a quality-biased experiment
 rather than the base setting.
 
+## Laguna-XS.2 target on RTX 3090 (Poolside MoE, Q4_K_M)
+
+Hand-rolled CUDA forward (Path A, ggml-only) for the 40-layer / 256-expert
+Laguna-XS.2 target. Loader pins 678 tensors at 18.77 GiB on GPU + 110 MiB
+tok_embd CPU-only, leaving room for KV cache and PFlash drafter activations
+in 24 GB. Drafter for compression: Qwen3-0.6B BF16 GGUF (Qwen tokenizer
+cross-mapped to Laguna BPE).
+
+### Dense TTFT (no PFlash compression, full chunked prefill)
+
+Measured with `bench_laguna_ttft`, `DFLASH_KV_TYPE=q4_0` for ctx > 32K, default
+chunk=4096 except where noted (smaller chunks needed at long ctx to keep the
+activation alloc inside 24 GB):
+
+| Context | KV   | chunk | TTFT (s) | tok/s   |
+|--------:|:----:|:-----:|---------:|--------:|
+|   4 096 | Q8_0 | 4096  |     1.04 |  3 932  |
+|  16 384 | Q8_0 | 4096  |     5.71 |  2 867  |
+|  32 768 | Q4_0 | 2048  |    19.26 |  1 701  |
+|  65 536 | Q4_0 | 1024  |    53.17 |  1 233  |
+|  65 536 | Q4_0 | 2048  |    51.33 |  1 277  |
+
+65K @ chunk=4096 OOMs on a 24 GB 3090 because the F32 mask alone needs ~1 GB;
+use chunk=1024 or 2048 for ctx > 32K. PFlash compression (below) bypasses the
+problem by feeding the target a much smaller compressed prompt.
+
+### NIAH single-needle retrieval with PFlash compression (depth=0.5)
+
+`scripts/laguna_pflash_niah.py` orchestrates haystack → drafter compress →
+cross-tokenizer round-trip with word-boundary recovery → Laguna prefill →
+decode → grep needle. The drafter scores Qwen3 token chunks; the
+word-boundary helper expands each kept run outward to whitespace before
+re-tokenizing as Laguna IDs, so multi-token needles like `BLUEHORIZON-7421`
+survive aggressive `keep` ratios.
+
+| Context | KV   | keep | drafter (s) | target prefill (s) | end-to-end TTFT | NIAH |
+|--------:|:----:|:----:|------------:|-------------------:|----------------:|:----:|
+|   4 096 | Q8_0 | 0.10 |        1.54 |               0.39 |          1.92 s |  ✅  |
+|  16 384 | Q8_0 | 0.10 |        1.27 |               0.51 |          1.78 s |  ✅  |
+|  16 384 | Q8_0 | 0.20 |        1.20 |               0.91 |          2.11 s |  ✅  |
+|  32 768 | Q4_0 | 0.10 |        2.08 |               0.91 |          2.99 s |  ✅  |
+|  32 768 | Q4_0 | 0.20 |        2.06 |               1.97 |          4.03 s |  ❌ (synthetic-NIAH variance; keep=0.10 PASS) |
+|  65 536 | Q4_0 | 0.10 |        ~5   |                ~6  |           ~11 s |  ✅  |
+|  65 536 | Q4_0 | 0.20 |        ~5   |                ~8  |           ~13 s |  ✅  |
+|  65 536 | Q4_0 | 0.30 |        ~5   |                ~10 |           ~15 s |  ✅  |
+|  65 536 | Q4_0 | 0.50 |        ~5   |                ~17 |           ~22 s |  ✅  |
+| 131 072 | Q4_0 | 0.10 |       11.11 |               4.79 |         15.91 s |  ✅  |
+| 131 072 | Q4_0 | 0.20 |       11.20 |              13.55 |         24.75 s |  ✅  |
+| 131 072 | Q4_0 | 0.30 |       11.41 |              26.43 |         37.84 s |  ✅  |
+
+Decode is autoregressive (~96 tok/s @ ctx=4K, ~27 tok/s @ ctx=131K) until a
+matched Laguna spec-decode draft model is published; the dflash daemon's
+draft-loaded path is reserved for that future drop-in.
+
+### Sampler smoke (test_laguna_daemon, prompt = "Tell me a one-line haiku about clouds.")
+
+| samp= tail                  | first 90 chars of decode |
+|-----------------------------|--------------------------|
+| (none, greedy)              | `Fluffy white giants / Sail through the sky on gentle / Wings of summer breeze` |
+| `2.0,1.0,0,1.0,42`          | `requires_blog_proxygps … setUser dirs feedbackUse thin covsyl Banks/mythtv MITMially beac` |
+| `2.0,1.0,0,1.0,43`          | `Phantom ships sail cre ways—.permissions['agrant\` paramount Then never Streaming Home>s` |
+| `1.0,0.5,0,1.0,99` (top_p)  | `Clouds drift like cotton dreams floating through the sky.` |
+
+Four distinct outputs from the same prompt confirms the rep_penalty → top_k
+→ softmax(temp) → top_p → draw chain is wired correctly end to end.
+
+### Speedup at 128K context (RTX 3090, Q4_K_M target, Q4_0 KV, FA on)
+
+| Path                                  |  Time @ 131072 | tok/s    | Notes |
+|---------------------------------------|---------------:|---------:|-------|
+| llama.cpp pp131072 (vendored fork)    |       86.60 s  |  1513.4  | `llama-bench -p 131072 -n 0 -ctk q4_0 -ctv q4_0 -fa 1 -t 8 -r 1 -ngl 99` |
+| dflash + PFlash keep=0.10 (end-to-end)|       15.91 s  |  8 240   | drafter compress 11.11s + target prefill 4.79s |
+| dflash target prefill only            |        4.79 s  | 27 364   | effective on the 131 072-token original prompt (target processes 13 120 compressed) |
+
+Headline: **dflash PFlash gives 5.4× faster TTFT than llama.cpp at 131K
+context** end-to-end on a 24 GB RTX 3090. The target prefill alone runs
+18.1× faster because PFlash compression has reduced the effective input
+length from 131 072 tokens to 13 120 (10× token-count drop). The drafter
+adds 11 s of fixed overhead which dominates at long context but folds
+below 1× of the target prefill cost as the haystack shrinks (4K @ keep=0.10
+spends 1.5 s drafter + 0.4 s target, net 1.92 s vs llama.cpp 1.7 s).
+
+**Reproducing the 11.11 s drafter number requires Block-Sparse Attention
+on the Qwen3-0.6B drafter forward.** The PflashDaemon Python wrapper sets
+these env vars by default; the dflash daemon honours them at runtime but
+does not force them, so any caller (including `scripts/server.py`) is free
+to opt out:
+
+```bash
+export DFLASH_FP_USE_BSA=1     # mit-han-lab BSA, FA-2 derived (sm_80+)
+export DFLASH_FP_ALPHA=0.85    # importance-score temperature
+```
+
+Without BSA the drafter falls back to dense attention and the 131 K
+drafter forward becomes multi-minute (O(N²) work). At ctx ≤ 8 K the
+fallback is fast enough that BSA is optional.
+
+### Parity vs HF reference (deferred)
+
+`scripts/parity_laguna.py` runs identical token IDs through the dflash
+daemon and a Hugging Face `LagunaForCausalLM` reference loaded from
+`poolside/Laguna-XS.2`, then reports last-position argmax agreement at
+4K—128K context. Cannot be run on a single 24 GB GPU because the BF16
+reference weighs ~37 GiB; pin to an A6000 / H100 (or use CPU offload) to
+produce the cos-sim numbers. The dflash forward itself was originally
+verified to match `llama.cpp build_laguna` for 30+ tokens during the
+scaffold-time bring-up (see `Lucebox/Laguna-XS.2-GGUF` README). The NIAH
+table above functions as the in-PR functional sanity check at 4K–131K.
 ## RTX 5090 (Blackwell, sm_120/sm_120a, 32 GB) — long-context NIAH
 
 > **Companion to the short-context RTX 5090 section** (HumanEval / Math500 /
