@@ -150,7 +150,9 @@ int main(int argc, char ** argv) {
     std::vector<float> embed_full((size_t)M * w.n_embd);
     if (!w.embedder.embed(laguna_ids.data(), M, embed_full.data())) {
         std::fprintf(stderr, "laguna embed failed at M=%d\n", M);
-        free_laguna_target_cache(cache); free_laguna_target_weights(w); free_drafter(drafter);
+        // drafter was already freed above before loading the laguna target;
+        // do NOT free it again here.
+        free_laguna_target_cache(cache); free_laguna_target_weights(w);
         return 1;
     }
 

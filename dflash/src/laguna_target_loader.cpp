@@ -204,6 +204,14 @@ bool load_target_gguf_laguna(const std::string & path,
         set_last_error("laguna: key_length != value_length not supported");
         gguf_free(gctx); return false;
     }
+    if (n_expert_used > n_expert) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "laguna: expert_used_count (%u) exceeds expert_count (%u)",
+            n_expert_used, n_expert);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
 
     // Per-layer head count (ARRAY of length n_layer).
     std::vector<uint32_t> heads_per_layer((size_t)n_layer, 0);
@@ -377,20 +385,28 @@ bool load_target_gguf_laguna(const std::string & path,
         }
     }
 
-    // ── 3. Allocate CUDA buffer for tensors (excludes tok_embd — stays on host) ─
+    // ── 3. Allocate CUDA buffer for tensors. Pre-pin tok_embd to host memory
+    //       so the allocator skips it (only allocates tensors with data == NULL).
+    //       Saves ~110 MiB VRAM; the embedder reads tok_embd directly from mmap.
+    LagunaMmap mm;
+    std::string err;
+    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    const size_t  data_start = gguf_get_data_offset(gctx);
+    const int64_t n_tensors  = gguf_get_n_tensors(gctx);
+    for (int64_t tid = 0; tid < n_tensors; ++tid) {
+        if (std::strcmp(gguf_get_tensor_name(gctx, tid), "token_embd.weight") == 0) {
+            out.tok_embd->data = (uint8_t *)mm.addr +
+                data_start + gguf_get_tensor_offset(gctx, tid);
+            break;
+        }
+    }
     out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
     if (!out.buf) {
         set_last_error("ggml_backend_alloc_ctx_tensors failed (laguna target)");
         gguf_free(gctx); return false;
     }
 
-    // ── 4. mmap + copy tensors to GPU ────────────────────────────────────
-    LagunaMmap mm;
-    std::string err;
-    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
-    const size_t  data_start = gguf_get_data_offset(gctx);
-    const int64_t n_tensors  = gguf_get_n_tensors(gctx);
-
+    // ── 4. Copy tensor bytes to GPU; remember tok_embd offset for the embedder ─
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;

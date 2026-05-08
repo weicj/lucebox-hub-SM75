@@ -98,20 +98,21 @@ def _run_dflash_argmax(bin_path: Path, gguf: Path, max_ctx: int,
     return ids[0]
 
 
+_HF_CACHE: dict = {}
+
+
 def _run_hf_argmax(model_id: str, prompt_ids: list[int]) -> int:
     import torch
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        low_cpu_mem_usage=True).to("cuda")
-    model.eval()
+    model = _HF_CACHE.get(model_id)
+    if model is None:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            low_cpu_mem_usage=True).to("cuda").eval()
+        _HF_CACHE[model_id] = model
     with torch.inference_mode():
         ids = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
-        out = model(input_ids=ids).logits[0, -1, :]
-        tok = int(out.argmax().item())
-    del model
-    torch.cuda.empty_cache()
-    return tok
+        return int(model(input_ids=ids).logits[0, -1, :].argmax().item())
 
 
 def main() -> int:

@@ -399,7 +399,7 @@ Four distinct outputs from the same prompt confirms the rep_penalty → top_k
 |---------------------------------------|---------------:|---------:|-------|
 | llama.cpp pp131072 (vendored fork)    |       86.60 s  |  1513.4  | `llama-bench -p 131072 -n 0 -ctk q4_0 -ctv q4_0 -fa 1 -t 8 -r 1 -ngl 99` |
 | dflash + PFlash keep=0.10 (end-to-end)|       15.91 s  |  8 240   | drafter compress 11.11s + target prefill 4.79s |
-| dflash target prefill only            |        4.79 s  | 27 364   | on the 13 120-token compressed prompt |
+| dflash target prefill only            |        4.79 s  | 27 364   | effective on the 131 072-token original prompt (target processes 13 120 compressed) |
 
 Headline: **dflash PFlash gives 5.4× faster TTFT than llama.cpp at 131K
 context** end-to-end on a 24 GB RTX 3090. The target prefill alone runs
