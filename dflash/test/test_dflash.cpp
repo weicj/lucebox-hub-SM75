@@ -60,6 +60,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <unistd.h>
 #endif
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2233,6 +2234,22 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "-ctv=", 5) == 0) {
             setenv("DFLASH27B_KV_V", argv[i] + 5, 1);
         }
+    }
+
+    // The KV type may also have been chosen via -ctk/-ctv, which sets
+    // DFLASH27B_KV_K / DFLASH27B_KV_V during the argv loop above. Re-check
+    // for TQ3 here so g_kq_stride_pad matches the chunked-FA driver's
+    // align_up(kv_len, 256); otherwise the host-built mask is short and the
+    // kernel reads past its end.
+    auto kv_env_is_tq3 = [](const char * name) {
+        const char * s = std::getenv(name);
+        if (!s) return false;
+        std::string lc;
+        for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
+        return lc.rfind("tq3", 0) == 0;
+    };
+    if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
+        g_kq_stride_pad = 256;
     }
 
     if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
