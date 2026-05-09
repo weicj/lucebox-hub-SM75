@@ -793,6 +793,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             completion_id, req.stream, len(req.messages), dict(role_counts),
             n_tools, prompt_len, req.max_tokens, max_ctx, req.model,
         )
+        t0 = time.monotonic()
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
@@ -1017,6 +1018,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                        "total_tokens": prompt_len + completion_tokens},
                         }
                         yield f"data: {json.dumps(usage_chunk)}\n\n"
+                    elapsed = time.monotonic() - t0
+                    tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
+                    log.info(
+                        "chat DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s",
+                        completion_id, prompt_len, completion_tokens,
+                        elapsed, tok_s, finish_reason,
+                    )
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
@@ -1108,6 +1116,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         else:
             msg["content"] = cleaned
 
+        elapsed = time.monotonic() - t0
+        tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
+        log.info(
+            "chat DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s",
+            completion_id, prompt_len, len(tokens),
+            elapsed, tok_s, finish_reason,
+        )
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
@@ -1483,17 +1498,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             return await _responses_stream(
                 chat_req, prompt_bin, prompt_ids, raw_msgs,
                 started_in_thinking, response_id, msg_item_id,
-                created_at, prompt_len)
+                created_at, prompt_len, time.monotonic())
         else:
             return await _responses_non_stream(
                 chat_req, prompt_bin, prompt_ids, raw_msgs,
                 started_in_thinking, response_id, msg_item_id,
-                created_at, prompt_len)
+                created_at, prompt_len, time.monotonic())
 
     async def _responses_non_stream(
             chat_req, prompt_bin, prompt_ids, raw_msgs,
             started_in_thinking, response_id, msg_item_id,
-            created_at, prompt_len):
+            created_at, prompt_len, t0):
         """Non-streaming Responses API handler."""
         async with daemon_lock:
             full_snap_prep_ref = [None]
@@ -1598,10 +1613,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             })
 
         out_types = [o.get("type") for o in output]
+        elapsed = time.monotonic() - t0
+        tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
         log.info(
-            "responses DONE %s  in=%d out=%d  output=%s  text_len=%d",
+            "responses DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  output=%s  text_len=%d",
             response_id, prompt_len, len(tokens),
-            out_types, len(cleaned),
+            elapsed, tok_s, out_types, len(cleaned),
         )
         return JSONResponse({
             "id": response_id,
@@ -1621,7 +1638,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     async def _responses_stream(
             chat_req, prompt_bin, prompt_ids, raw_msgs,
             started_in_thinking, response_id, msg_item_id,
-            created_at, prompt_len):
+            created_at, prompt_len, t0):
         """Streaming Responses API handler — emits Responses SSE events."""
 
         async def sse() -> AsyncIterator[str]:
@@ -1855,10 +1872,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     "total_tokens": prompt_len + completion_tokens,
                 }
                 out_types = [o.get("type") for o in final_output]
+                elapsed = time.monotonic() - t0
+                tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
                 log.info(
-                    "responses DONE %s  in=%d out=%d  output=%s  text_len=%d",
+                    "responses DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  output=%s  text_len=%d",
                     response_id, prompt_len, completion_tokens,
-                    out_types, len(accumulated_text),
+                    elapsed, tok_s, out_types, len(accumulated_text),
                 )
                 yield _resp_sse("response.completed", {"response": shell})
 
