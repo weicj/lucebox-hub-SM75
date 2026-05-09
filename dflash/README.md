@@ -436,6 +436,7 @@ model = "luce-dflash"
 model_provider = "dflash"
 
 [model_providers.dflash]
+name = "DFlash"
 base_url = "http://localhost:8080/v1"
 wire_api = "responses"
 supports_websockets = false
