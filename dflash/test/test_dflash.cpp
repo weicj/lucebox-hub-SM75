@@ -2707,7 +2707,11 @@ int main(int argc, char ** argv) {
                     std::printf("[unpark] target restored\n"); std::fflush(stdout);
                 }
                 if (want_draft && draft_parked) {
-                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
+                    std::string dp(draft_path);
+                    bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
+                        ? load_draft_gguf(draft_path, draft_backend, dw)
+                        : load_draft_safetensors(draft_path, draft_backend, dw);
+                    if (!draft_ok) {
                         std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                         stream_emit(-1); continue;
                     }
