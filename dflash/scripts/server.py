@@ -781,6 +781,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
+                nonlocal started_in_thinking
                 async with daemon_lock:
                     full_snap_prep_ref = [None]
                     snap_prep = None
@@ -1128,6 +1129,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
+                nonlocal started_in_thinking
                 async with daemon_lock:
                     full_snap_prep_ref = [None]
                     snap_prep = None
