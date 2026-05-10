@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from _prefill_hook import PrefillConfig
-from prefix_cache import PrefixCache, hash_prefix
+from prefix_cache import FullCacheEntry, PrefixCache, hash_prefix
 from server import build_app
 
 
@@ -22,7 +22,8 @@ class FakeTokenizer:
 
 
 def make_cache(tmp_path: Path, *, cap: int = 2, full_cap: int = 2,
-               kv_k_type: str = "q8_0", fa_window: int = 2048) -> PrefixCache:
+               kv_k_type: str = "q8_0", fa_window: int = 2048,
+               budget_bytes: int = 0) -> PrefixCache:
     async def await_reply(prefix: str, timeout: float = 10.0) -> str:
         return prefix
 
@@ -35,12 +36,13 @@ def make_cache(tmp_path: Path, *, cap: int = 2, full_cap: int = 2,
         fa_window=fa_window,
         cap=cap,
     )
-    cache.init_full_cache(full_cap, cache_dir=str(tmp_path))
+    cache.init_full_cache(full_cap, cache_dir=str(tmp_path), budget_bytes=budget_bytes)
     return cache
 
 
 def write_meta(cache: PrefixCache, key: bytes, *, cur_ids_len: int,
-               last_used_ns: int, kv_k_type: str | None = None,
+               last_used_ns: int, raw_prompt_len: int | None = None,
+               kv_k_type: str | None = None,
                fa_window: int | None = None) -> None:
     meta = {
         "version": cache.FULL_META_VERSION,
@@ -48,6 +50,7 @@ def write_meta(cache: PrefixCache, key: bytes, *, cur_ids_len: int,
         "kv_k_type": kv_k_type or cache.kv_k_type,
         "fa_window": cache.fa_window if fa_window is None else fa_window,
         "cur_ids_len": cur_ids_len,
+        "raw_prompt_len": cur_ids_len if raw_prompt_len is None else raw_prompt_len,
         "last_used_ns": last_used_ns,
     }
     cache._full_meta_path(key).write_text(json.dumps(meta), encoding="utf-8")
@@ -73,11 +76,11 @@ def test_rehydrate_full_cache_restores_valid_entries(tmp_path):
         str(restored_cache._full_bin_path(key)),
         7,
     )
-    assert restored_cache.full_entries[key] == (
-        restored_cache._full_slot_base,
-        str(restored_cache._full_bin_path(key)),
-        7,
-    )
+    entry = restored_cache.full_entries[key]
+    assert entry.slot == restored_cache._full_slot_base
+    assert entry.cur_bin_path == str(restored_cache._full_bin_path(key))
+    assert entry.cur_ids_len == 7
+    assert entry.raw_prompt_len == len(prompt_ids)
 
 
 def test_rehydrate_full_cache_skips_stale_metadata(tmp_path):
@@ -115,6 +118,145 @@ def test_rehydrate_full_cache_keeps_most_recent_entries_within_cap(tmp_path):
         (cache._full_slot_base + 1, f"{keys[2].hex()}.bin", 3),
     ]
     assert list(cache.full_entries.keys()) == [keys[1], keys[2]]
+
+
+def test_score_victim_selector_prefers_lower_usefulness(tmp_path):
+    cache = make_cache(tmp_path)
+    low_key = b"\x10" * 16
+    high_key = b"\x20" * 16
+    cache._full_bin_path(low_key).write_bytes(b"a" * 100)
+    cache._full_meta_path(low_key).write_text("{}", encoding="utf-8")
+    cache._full_bin_path(high_key).write_bytes(b"b" * 10)
+    cache._full_meta_path(high_key).write_text("{}", encoding="utf-8")
+    cache.full_entries[low_key] = FullCacheEntry(
+        slot=cache._full_slot_base,
+        cur_bin_path=str(cache._full_bin_path(low_key)),
+        cur_ids_len=40,
+        raw_prompt_len=40,
+        last_used_ns=10,
+        hits=0,
+    )
+    cache.full_entries[high_key] = FullCacheEntry(
+        slot=cache._full_slot_base + 1,
+        cur_bin_path=str(cache._full_bin_path(high_key)),
+        cur_ids_len=80,
+        raw_prompt_len=80,
+        last_used_ns=5,
+        hits=3,
+    )
+
+    victim_key, _ = cache._select_full_victim_from_entries(cache.full_entries)
+    assert victim_key == low_key
+
+
+def test_score_victim_selector_breaks_ties_by_oldest_last_used(tmp_path):
+    cache = make_cache(tmp_path)
+    key_a = b"\x31" * 16
+    key_b = b"\x32" * 16
+    for key in (key_a, key_b):
+        cache._full_bin_path(key).write_bytes(b"x" * 20)
+        cache._full_meta_path(key).write_text("{}", encoding="utf-8")
+    cache.full_entries[key_a] = FullCacheEntry(
+        slot=cache._full_slot_base,
+        cur_bin_path=str(cache._full_bin_path(key_a)),
+        cur_ids_len=20,
+        raw_prompt_len=20,
+        last_used_ns=1,
+        hits=0,
+    )
+    cache.full_entries[key_b] = FullCacheEntry(
+        slot=cache._full_slot_base + 1,
+        cur_bin_path=str(cache._full_bin_path(key_b)),
+        cur_ids_len=20,
+        raw_prompt_len=20,
+        last_used_ns=2,
+        hits=0,
+    )
+
+    victim_key, _ = cache._select_full_victim_from_entries(cache.full_entries)
+    assert victim_key == key_a
+
+
+def test_live_prefix_penalty_makes_strict_prefix_easier_to_evict(tmp_path):
+    cache = make_cache(tmp_path)
+    prompt_a = [1, 2, 3, 4]
+    prompt_b = [1, 2, 3, 4, 5, 6]
+    key_a = hash_prefix(prompt_a, cache.kv_k_type, cache.fa_window)
+    key_b = hash_prefix(prompt_b, cache.kv_k_type, cache.fa_window)
+    for key in (key_a, key_b):
+        cache._full_bin_path(key).write_bytes(b"x" * 20)
+        cache._full_meta_path(key).write_text("{}", encoding="utf-8")
+    cache.full_entries[key_a] = FullCacheEntry(
+        slot=cache._full_slot_base,
+        cur_bin_path=str(cache._full_bin_path(key_a)),
+        cur_ids_len=4,
+        raw_prompt_len=len(prompt_a),
+        last_used_ns=10,
+        hits=0,
+    )
+    cache.full_entries[key_b] = FullCacheEntry(
+        slot=cache._full_slot_base + 1,
+        cur_bin_path=str(cache._full_bin_path(key_b)),
+        cur_ids_len=6,
+        raw_prompt_len=len(prompt_b),
+        last_used_ns=5,
+        hits=0,
+    )
+
+    victim_key, _ = cache._select_full_victim_from_entries(cache.full_entries, prompt_b)
+    assert victim_key == key_a
+
+
+def test_budget_trim_retires_lowest_score_entry(tmp_path):
+    cache = make_cache(tmp_path)
+    key_a = b"\x41" * 16
+    key_b = b"\x42" * 16
+    cache._full_bin_path(key_a).write_bytes(b"a" * 90)
+    write_meta(cache, key_a, cur_ids_len=10, raw_prompt_len=10, last_used_ns=1)
+    cache._full_bin_path(key_b).write_bytes(b"b" * 20)
+    write_meta(cache, key_b, cur_ids_len=50, raw_prompt_len=50, last_used_ns=2)
+    cache.full_entries[key_a] = FullCacheEntry(
+        slot=cache._full_slot_base,
+        cur_bin_path=str(cache._full_bin_path(key_a)),
+        cur_ids_len=10,
+        raw_prompt_len=10,
+        last_used_ns=1,
+        hits=0,
+    )
+    cache.full_entries[key_b] = FullCacheEntry(
+        slot=cache._full_slot_base + 1,
+        cur_bin_path=str(cache._full_bin_path(key_b)),
+        cur_ids_len=50,
+        raw_prompt_len=50,
+        last_used_ns=2,
+        hits=0,
+    )
+    cache._full_budget_bytes = cache._full_entry_artifact_size(key_b, cache.full_entries[key_b]) + 1
+
+    cache._enforce_full_budget()
+
+    assert list(cache.full_entries.keys()) == [key_b]
+    assert not cache._full_bin_path(key_a).exists()
+    assert not cache._full_meta_path(key_a).exists()
+
+
+def test_lookup_full_updates_hits_in_memory_only(tmp_path):
+    prompt_ids = [7, 8, 9, 10]
+    source_path = tmp_path / "source.bin"
+    source_path.write_bytes(b"payload")
+
+    cache = make_cache(tmp_path)
+    cache.confirm_full_snap(cache._full_slot_base, prompt_ids, source_path, 5)
+    key = hash_prefix(prompt_ids, cache.kv_k_type, cache.fa_window)
+    before = json.loads(cache._full_meta_path(key).read_text(encoding="utf-8"))
+
+    hit = cache.lookup_full(prompt_ids)
+
+    assert hit is not None
+    assert cache.full_entries[key].hits == 1
+    after = json.loads(cache._full_meta_path(key).read_text(encoding="utf-8"))
+    assert "hits" not in after
+    assert after["last_used_ns"] >= before["last_used_ns"]
 
 
 def test_server_startup_rehydrates_full_cache(tmp_path):

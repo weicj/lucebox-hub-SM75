@@ -579,6 +579,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
               prefill_cache_slots: int = 4,
+              prefill_cache_bytes: int = 0,
               arch: str = "qwen35",
               lazy_draft: bool = False,
               verbose_daemon: bool = False) -> FastAPI:
@@ -671,7 +672,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         cap=prefix_cache_slots,
     )
     if prefill_cfg is not None and prefill_cache_slots > 0:
-        prefix_cache.init_full_cache(prefill_cache_slots)
+        prefix_cache.init_full_cache(prefill_cache_slots, budget_bytes=prefill_cache_bytes)
 
     @app.on_event("startup")
     async def _startup():
@@ -2232,6 +2233,9 @@ def main():
                          "timing and per-step diagnostics.")
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    ap.add_argument("--prefill-cache-bytes", type=int, default=0,
+                    help="Disk budget in bytes for persisted full-cache artifacts. "
+                         "0 disables budget trimming.")
     ap.add_argument("--daemon", action="store_true")
     add_cli_flags(ap)
     args = ap.parse_args()
@@ -2298,6 +2302,7 @@ def main():
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
                     prefill_cache_slots=args.prefill_cache_slots,
+                    prefill_cache_bytes=args.prefill_cache_bytes,
                     arch=arch,
                     lazy_draft=args.lazy_draft,
                     verbose_daemon=args.verbose_daemon)
