@@ -146,7 +146,7 @@ def main():
 
         # Decode compressed ids with DRAFTER tokenizer, re-encode with TARGET + chat template.
         comp_text = drafter_tok.decode(compressed_ids, skip_special_tokens=True)
-        user_msg = comp_text + "\n\nAnswer the user question based on the above context. Give only the answer."
+        user_msg = comp_text + "\n\nAnswer the user question based on the above context."
         chat_kwargs = {"tokenize": False, "add_generation_prompt": True}
         if args.no_thinking:
             chat_kwargs["enable_thinking"] = False
