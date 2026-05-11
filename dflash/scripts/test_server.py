@@ -99,6 +99,11 @@ class TestParseReasoning:
         assert cleaned == "result"
         assert "line1" in reasoning and "line3" in reasoning
 
+    def test_repeated_leading_think_closers_are_stripped(self):
+        cleaned, reasoning = parse_reasoning("</think>\n</think>\n8")
+        assert cleaned == "8"
+        assert reasoning is None
+
 
 # ─── parse_tool_calls ─────────────────────────────────────────────
 
@@ -430,6 +435,30 @@ def test_chat_completions_streaming(mock_os_read, mock_pipe, mock_tokenizer, app
     assert all(c["object"] == "chat.completion.chunk" for c in chunks)
 
 
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_chat_completions_streaming_ignores_stray_think_closers(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_tokenizer.decode.side_effect = ["</think>", "</think>", "8"]
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10), struct.pack("<i", 11),
+        struct.pack("<i", 12), struct.pack("<i", -1),
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "4+4=?"}],
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    text = response.text
+    assert "</think>" not in text
+    assert '"content":"8"' in text or '"content": "8"' in text
+
+
 # ─── POST /v1/responses ───────────────────────────────────────────
 
 @patch("server.os.pipe")
@@ -562,6 +591,30 @@ def test_responses_streaming(mock_os_read, mock_pipe, mock_tokenizer, app):
             assert completed["response"]["status"] == "completed"
             assert "usage" in completed["response"]
             break
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_responses_streaming_ignores_stray_think_closers(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_tokenizer.decode.side_effect = ["</think>", "</think>", "8"]
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10), struct.pack("<i", 11),
+        struct.pack("<i", 12), struct.pack("<i", -1),
+    ]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": "4+4=?",
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    text = response.text
+    assert "</think>" not in text
+    assert '"delta":"8"' in text or '"delta": "8"' in text
 
 
 @patch("server.os.pipe")

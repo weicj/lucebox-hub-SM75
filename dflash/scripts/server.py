@@ -205,15 +205,18 @@ def parse_reasoning(
     so the generated text contains only the reasoning body + ``</think>``.
     Returns (cleaned_content, reasoning_content).
     """
+    def _strip_leading_think_closers(value: str) -> str:
+        return re.sub(r"^(?:\s*</think>\s*)+", "", value).strip()
+
     parts = text.partition(THINK_OPEN_TAG)
     saw_open_tag = bool(parts[1])
     rest = parts[2] if saw_open_tag else parts[0]
     if THINK_CLOSE_TAG not in rest:
         if thinking_enabled and (started_in_thinking or saw_open_tag):
             return "", (rest.strip() or None)
-        return rest.strip(), None
+        return _strip_leading_think_closers(rest), None
     reasoning, _, content = rest.partition(THINK_CLOSE_TAG)
-    return content.strip(), (reasoning.strip() or None)
+    return _strip_leading_think_closers(content), (reasoning.strip() or None)
 
 
 def _find_tool_properties(tools, function_name):
@@ -1202,9 +1205,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                                 else:  # mode == "content"
                                     think_idx = window.find(THINK_OPEN_TAG)
+                                    think_close_idx = window.find(THINK_CLOSE_TAG)
                                     tool_idx  = window.find(TOOL_OPEN_TAG)
                                     hits = [(i, t) for i, t in
-                                            ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                            ((think_idx, "think"),
+                                             (think_close_idx, "think_close"),
+                                             (tool_idx, "tool")) if i != -1]
                                     if hits:
                                         hits.sort()
                                         idx, which = hits[0]
@@ -1214,6 +1220,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         if which == "think":
                                             window = window[idx + len(THINK_OPEN_TAG):]
                                             mode = "reasoning"
+                                        elif which == "think_close":
+                                            window = window[idx + len(THINK_CLOSE_TAG):]
                                         else:
                                             tool_buffer = window[idx:]
                                             window = ""
@@ -2045,9 +2053,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                             else:  # content
                                 think_idx = window.find(THINK_OPEN_TAG)
+                                think_close_idx = window.find(THINK_CLOSE_TAG)
                                 tool_idx = window.find(TOOL_OPEN_TAG)
                                 hits = [(i, t) for i, t in
-                                        ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                        ((think_idx, "think"),
+                                         (think_close_idx, "think_close"),
+                                         (tool_idx, "tool")) if i != -1]
                                 if hits:
                                     hits.sort()
                                     idx, which = hits[0]
@@ -2060,6 +2071,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     if which == "think":
                                         window = window[idx + len(THINK_OPEN_TAG):]
                                         mode = "reasoning"
+                                    elif which == "think_close":
+                                        window = window[idx + len(THINK_CLOSE_TAG):]
                                     else:
                                         tool_buffer = window[idx:]
                                         window = ""

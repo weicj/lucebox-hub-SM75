@@ -240,6 +240,36 @@ def test_budget_trim_retires_lowest_score_entry(tmp_path):
     assert not cache._full_meta_path(key_a).exists()
 
 
+def test_budget_trim_recomputes_next_free_slot(tmp_path):
+    cache = make_cache(tmp_path, full_cap=3)
+    keys = [bytes([0x51 + i]) * 16 for i in range(3)]
+    sizes = [120, 20, 20]
+    for idx, (key, size) in enumerate(zip(keys, sizes), start=1):
+        cache._full_bin_path(key).write_bytes(b"x" * size)
+        write_meta(cache, key, cur_ids_len=10 * idx, raw_prompt_len=10 * idx, last_used_ns=idx)
+        cache.full_entries[key] = FullCacheEntry(
+            slot=cache._full_slot_base + (idx - 1),
+            cur_bin_path=str(cache._full_bin_path(key)),
+            cur_ids_len=10 * idx,
+            raw_prompt_len=10 * idx,
+            last_used_ns=idx,
+            hits=0,
+        )
+    cache._full_next_slot = 0
+    cache._full_budget_bytes = sum(
+        cache._full_entry_artifact_size(key, cache.full_entries[key]) for key in keys[1:]
+    ) + 1
+
+    cache._enforce_full_budget()
+
+    remaining_slots = {entry.slot for entry in cache.full_entries.values()}
+    assert cache._full_slot_base not in remaining_slots
+    prep = cache.prepare_full_snap([9, 9, 9, 9])
+    assert prep is not None
+    slot, _ = prep
+    assert slot == cache._full_slot_base
+
+
 def test_lookup_full_updates_hits_in_memory_only(tmp_path):
     prompt_ids = [7, 8, 9, 10]
     source_path = tmp_path / "source.bin"

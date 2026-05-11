@@ -744,6 +744,35 @@ class PrefixCache:
                 continue
         return total
 
+    def _recompute_full_next_slot(self) -> None:
+        if getattr(self, "_full_disabled", True) or self._full_cap <= 0:
+            self._full_next_slot = 0
+            return
+        occupied = {
+            entry.slot - self._full_slot_base
+            for entry in self.full_entries.values()
+            if self._full_slot_base <= entry.slot < self._full_slot_base + self._full_cap
+        }
+        for offset in range(self._full_cap):
+            idx = (self._full_next_slot + offset) % self._full_cap
+            if idx not in occupied:
+                self._full_next_slot = idx
+                return
+        self._full_next_slot = 0
+
+    def _reserve_next_free_full_slot(self) -> int | None:
+        if getattr(self, "_full_disabled", True) or self._full_cap <= 0:
+            return None
+        self._recompute_full_next_slot()
+        occupied = {entry.slot for entry in self.full_entries.values()}
+        for offset in range(self._full_cap):
+            idx = (self._full_next_slot + offset) % self._full_cap
+            abs_slot = self._full_slot_base + idx
+            if abs_slot not in occupied:
+                self._full_next_slot = (idx + 1) % self._full_cap
+                return abs_slot
+        return None
+
     def _full_entry_score(self, key: bytes, entry: FullCacheEntry,
                           live_prompt_ids: list[int] | None = None) -> float:
         file_size = self._full_entry_artifact_size(key, entry)
@@ -789,6 +818,7 @@ class PrefixCache:
             except OSError:
                 pass
             self._drop_full_metadata(key)
+        self._recompute_full_next_slot()
 
     def _enforce_full_budget(self, live_prompt_ids: list[int] | None = None) -> None:
         budget = int(getattr(self, "_full_budget_bytes", 0) or 0)
@@ -808,6 +838,7 @@ class PrefixCache:
                   f"score={victim_score:.6f} "
                   f"size={victim_size}", flush=True)
             total = total - victim_size if total >= victim_size else 0
+        self._recompute_full_next_slot()
 
     def _load_persisted_full_entries(self) -> list[tuple[bytes, FullCacheEntry]]:
         """Return persisted full-cache entries sorted from LRU → MRU."""
@@ -918,7 +949,7 @@ class PrefixCache:
                 if restored >= self._full_cap:
                     break
 
-        self._full_next_slot = restored % self._full_cap if self._full_cap > 0 else 0
+        self._recompute_full_next_slot()
         if restored:
             print(f"{self.log_prefix} full-cache restored {restored} entries "
                   f"from disk", flush=True)
@@ -978,8 +1009,9 @@ class PrefixCache:
             self._full_pending_evict_path = old_entry.cur_bin_path
             abs_slot = old_entry.slot
         else:
-            abs_slot = self._full_slot_base + self._full_next_slot
-            self._full_next_slot = (self._full_next_slot + 1) % self._full_cap
+            abs_slot = self._reserve_next_free_full_slot()
+            if abs_slot is None:
+                return None
             self._full_pending_evict_key = None
             self._full_pending_evict_path = None
 
