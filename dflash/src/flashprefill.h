@@ -56,20 +56,22 @@ int flash_prefill_forward_bf16(
     float scale,
     const FlashPrefillConfig & cfg);
 
-// ggml flash_attn_ext-based implementation. Works on all SM targets (75+).
+// ggml flash_attn_ext-based implementation for CUDA/HIP builds supported by
+// the selected ggml backend and GPU architecture.
 // Same interface as flash_prefill_forward_bf16 but uses ggml's FA internally
-// (chunked causal attention). Accepts BF16/F16 Q/K/V tensors stored in the
-// same [B, S, H, D] contiguous layout. No custom WMMA kernels needed.
+// (chunked causal attention). Accepts BF16/F16/F32 Q/K/V tensors stored in the
+// same [B, S, H, D] contiguous layout. The caller must pass the real ggml type;
+// F16 and BF16 are both 2-byte values but are not bit-compatible.
 //
-// On SM < 80 this is the only available path (BF16 WMMA doesn't exist).
-// On SM >= 80 callers may prefer flash_prefill_forward_bf16 for the
-// block-sparse selection + custom WMMA kernel path.
+// Builds without CUDA BF16 WMMA support use this as the available FlashPrefill
+// path. CUDA builds with the custom WMMA kernels may prefer
+// flash_prefill_forward_bf16 for block-sparse selection.
 int flash_prefill_forward_q8(
     ggml_backend_t backend,
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
     float scale,
-    int elem_size,
+    ggml_type qkv_type,
     const FlashPrefillConfig & cfg);
 
 #ifdef DFLASH27B_HAVE_BSA

@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
 #if defined(__HIPCC__)
 #include "../deps/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h"
 using __nv_bfloat16 = __hip_bfloat16;

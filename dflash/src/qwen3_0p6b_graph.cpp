@@ -60,7 +60,7 @@ int chunk_s_ff() {
         int v = std::atoi(e);
         if (v >= 1024) return v;
     }
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
     return 1024;
 #else
     return 4096;
@@ -129,7 +129,7 @@ void free_hip_chunk_graph_b(HipChunkGraphB & g) {
     g = {};
 }
 
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
 bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
                              ggml_backend_t backend,
                              int hidden,
@@ -280,9 +280,10 @@ bool forward_qwen3_0p6b_drafter(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 on Ampere+ (native tensor core support), F16 on Turing.
+        // Use BF16 only when the CUDA WMMA fastpath is compiled. Other CUDA
+        // arches and HIP use F16 with ggml flash_attn_ext for the portable path.
         const ggml_type half_type =
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -359,7 +360,7 @@ bool forward_qwen3_0p6b_drafter(
         ggml_backend_get_default_buffer_type(w.backend));
 
     flashprefill::FlashPrefillConfig fp_cfg;
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
     // The HIP sparse-forward kernel is much slower when FlashPrefill keeps a
     // broad set of K blocks. Use a stricter default on ROCm; callers can still
     // override with DFLASH_FP_ALPHA for quality/speed sweeps.
@@ -489,13 +490,13 @@ bool forward_qwen3_0p6b_drafter(
         // Use the custom BF16 WMMA / rocWMMA path otherwise.
         auto tF0 = std::chrono::steady_clock::now();
         const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) && DFLASH27B_MIN_SM >= 80
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL)
                                  && true;
 #else
                                  && false;
 #endif
         if (use_bf16_fp) {
-#if DFLASH27B_MIN_SM >= 80
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL)
             int rc = flashprefill::flash_prefill_forward_bf16(
                 Q_buf.t->data,
                 K_curr_v[il].t->data,
@@ -521,7 +522,7 @@ bool forward_qwen3_0p6b_drafter(
                 V_curr_v[il].t->data,
                 attn_out_buf.t->data,
                 1, S, H, Hk, D, scale,
-                (int)ggml_element_size(Q_buf.t),
+                Q_buf.t->type,
                 fp_cfg);
             if (rc != 0) {
                 set_last_error("flash_prefill_forward_q8 failed at layer " + std::to_string(il));
@@ -537,7 +538,7 @@ bool forward_qwen3_0p6b_drafter(
         }
 
         // ── Graph B (chunked, reusable): o_proj + residual + ffn + write hidden_buf ──
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
         auto tB_setup0 = std::chrono::steady_clock::now();
         HipChunkGraphB gb{};
         if (!build_hip_chunk_graph_b(L, w.backend, hidden, D * H, chunk_s_ff_v, eps, gb)) {

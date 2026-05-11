@@ -34,7 +34,7 @@ void launch_compute_block_score_bf16(
     int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_USE_HIP
+#ifdef DFLASH27B_BACKEND_HIP
 // Phase 4 (HIP): mean_Q + tiled rocWMMA GEMM replaces the O(M²) scalar
 // block-score kernel. ~5-10× faster on the score step at 8K-32K context.
 void launch_compute_block_score_gemm_bf16(
@@ -118,7 +118,7 @@ int flash_prefill_forward_bf16(
     int s_S_b = M * N * H, s_S_m = N * H, s_S_n = H, s_S_h = 1;
     int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
     int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
-#ifdef DFLASH27B_USE_HIP
+#ifdef DFLASH27B_BACKEND_HIP
     // mean_Q layout: [B, M, H, D] BF16
     int s_mQ_b = M * H * D, s_mQ_m = H * D, s_mQ_h = D;
 #endif
@@ -130,7 +130,7 @@ int flash_prefill_forward_bf16(
     cudaError_t e;
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
     if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-#ifdef DFLASH27B_USE_HIP
+#ifdef DFLASH27B_BACKEND_HIP
     if ((e = cudaMalloc(&dmQ,  (size_t)B * M * H  * D * 2)) != cudaSuccess) goto err;  // bf16
 #else
     if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
@@ -150,7 +150,7 @@ int flash_prefill_forward_bf16(
 
     if (prof) cudaEventRecord(pE[1]);
     // 2. block scores
-#ifdef DFLASH27B_USE_HIP
+#ifdef DFLASH27B_BACKEND_HIP
     // Phase 4: mean_Q + rocWMMA GEMM replaces the O(M²) scalar kernel.
     launch_compute_mean_vector_bf16(
         Q, dmQ, B, S, H, D, BLOCK,

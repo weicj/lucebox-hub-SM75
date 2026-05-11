@@ -70,7 +70,7 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
 bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     static bool warmed = false;
     if (warmed || std::getenv("DFLASH_FP_SKIP_PREWARM")) {
@@ -185,7 +185,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         out.weights.n_vocab);
     std::fflush(stderr);
 
-#if defined(DFLASH27B_USE_HIP)
+#if defined(DFLASH27B_BACKEND_HIP)
     if (!prewarm_drafter_once(out.weights)) {
         free_drafter(out);
         return false;

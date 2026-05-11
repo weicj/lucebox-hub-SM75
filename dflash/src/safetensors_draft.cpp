@@ -325,22 +325,17 @@ static void bf16_to_f16_array(const uint16_t * src, uint16_t * dst, size_t n) {
     }
 }
 
-// Returns true if the current CUDA device has native BF16 tensor core support
-// (Ampere SM 8.0+). On Turing (SM 7.5) cuBLAS BF16 GEMM falls back to slow
-// CUDA cores instead of tensor cores. Uses ggml's CUDA backend info at runtime.
-static bool cuda_has_native_bf16() {
-    // Check at runtime: link against ggml-cuda's device info if available,
-    // otherwise fall back to env var DFLASH27B_DRAFT_FP16 for manual override.
+// Returns true when this build should keep draft projection weights as BF16.
+// CUDA builds keep BF16 only when built for native BF16 tensor-core support;
+// all other builds convert to F16 unless explicitly overridden.
+static bool build_prefers_bf16_projection() {
     const char * env = std::getenv("DFLASH27B_DRAFT_FP16");
     if (env && std::atoi(env) != 0) return false;  // force fp16
 
-    // Probe via ggml_backend_cuda device properties (compiled-in at build time).
-    // The CMAKE_CUDA_ARCHITECTURES list tells us the minimum supported arch.
-    // If the smallest arch is < 80, return false.
-#if defined(DFLASH27B_MIN_SM) && DFLASH27B_MIN_SM < 80
-    return false;
-#else
+#if defined(DFLASH27B_BACKEND_CUDA) && defined(DFLASH27B_CUDA_MIN_SM) && DFLASH27B_CUDA_MIN_SM >= 80
     return true;
+#else
+    return false;
 #endif
 }
 
@@ -398,12 +393,12 @@ bool load_draft_safetensors(const std::string & path,
 
     // ── 4. Create named tensors in the context ───────────────────
     //
-    // Norms (rms_norm weights) are loaded as F32 because ggml's CUDA
+    // Norms (rms_norm weights) are loaded as F32 because ggml's GPU
     // elementwise ops require F32/F16 operands. Projection weights stay bf16
-    // on Ampere+ (native tensor core support) or are converted to fp16 on
-    // Turing (SM 7.5) where cuBLAS BF16 GEMM falls back to slow CUDA cores.
+    // only when the selected CUDA arch has native tensor-core BF16 support;
+    // otherwise they are converted to fp16 for the portable path.
     const ggml_type NORM_GT = GGML_TYPE_F32;
-    const bool native_bf16 = cuda_has_native_bf16();
+    const bool native_bf16 = build_prefers_bf16_projection();
     const ggml_type PROJ_GT = native_bf16 ? GGML_TYPE_COUNT : GGML_TYPE_F16;
 
     out.fc          = alloc_tensor(out.ctx, st, "fc.weight",           {HIDDEN, FC_IN},  "BF16", PROJ_GT);
@@ -440,7 +435,7 @@ bool load_draft_safetensors(const std::string & path,
     // Walk the tensors in the context and upload their bytes.
     // For tensors whose ggml type differs from the safetensors dtype (i.e.
     // BF16-on-disk, F32-in-ggml for norms, or BF16-on-disk, F16-in-ggml for
-    // projection weights on Turing), convert on the fly via scratch buffers.
+    // projection weights without native BF16), convert on the fly via scratch buffers.
     std::vector<float>    scratch_f32;
     std::vector<uint16_t> scratch_f16;
     for (ggml_tensor * t = ggml_get_first_tensor(out.ctx); t != nullptr;

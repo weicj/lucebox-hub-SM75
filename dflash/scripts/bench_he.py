@@ -318,6 +318,8 @@ def main():
                     help="Use paper's pure best-first (no chain pre-seed)")
     ap.add_argument("--draft-feature-mirror", action="store_true",
                     help="Use the draft-side target feature mirror path")
+    ap.add_argument("--peer-access", action="store_true",
+                    help="Prefer CUDA P2P memcpy between GPUs when available (else host-staged copy)")
     ap.add_argument("--target-gpu", type=int, default=None,
                     help="Visible CUDA device id for the target backend")
     ap.add_argument("--draft-gpu", type=int, default=None,
@@ -330,6 +332,14 @@ def main():
                     help="Load the draft alongside the target layer-split harness")
     ap.add_argument("--target-split-dflash", action="store_true",
                     help="Run chain DFlash decode through the target layer-split harness")
+    ap.add_argument("--draft-ipc-bin", default=None,
+                    help="Path to a different-backend test_dflash used as the remote draft daemon")
+    ap.add_argument("--draft-ipc-gpu", type=int, default=None,
+                    help="GPU id passed to the remote draft daemon")
+    ap.add_argument("--draft-ipc-work-dir", default=None,
+                    help="Work directory for host-file IPC with the remote draft daemon")
+    ap.add_argument("--draft-ipc-ring-cap", type=int, default=None,
+                    help="Feature-ring capacity for the remote draft daemon")
     ap.add_argument("--max-ctx", type=int, default=None,
                     help="Forward --max-ctx=N to test_dflash")
     ap.add_argument("--prefill-ubatch", type=int, default=None,
@@ -381,6 +391,8 @@ def main():
     extra_args = []
     if args.draft_feature_mirror:
         extra_args.append("--draft-feature-mirror")
+    if args.peer_access:
+        extra_args.append("--peer-access")
     if args.target_gpu is not None:
         extra_args.append(f"--target-gpu={args.target_gpu}")
     if args.draft_gpu is not None:
@@ -393,6 +405,14 @@ def main():
         extra_args.append("--target-split-load-draft")
     if args.target_split_dflash:
         extra_args.append("--target-split-dflash")
+    if args.draft_ipc_bin:
+        extra_args.append(f"--draft-ipc-bin={args.draft_ipc_bin}")
+    if args.draft_ipc_gpu is not None:
+        extra_args.append(f"--draft-ipc-gpu={args.draft_ipc_gpu}")
+    if args.draft_ipc_work_dir:
+        extra_args.append(f"--draft-ipc-work-dir={args.draft_ipc_work_dir}")
+    if args.draft_ipc_ring_cap is not None:
+        extra_args.append(f"--draft-ipc-ring-cap={args.draft_ipc_ring_cap}")
     if args.max_ctx is not None:
         extra_args.append(f"--max-ctx={args.max_ctx}")
 
