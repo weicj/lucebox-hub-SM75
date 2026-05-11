@@ -621,7 +621,8 @@ static bool copy_peer_async(void * dst, int dst_device,
         return cudaDeviceSynchronize() == cudaSuccess;
     }
     log_staged_cross_gpu_once();
-    return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes, stream);
+    return dflash_cuda_copy_between_devices(src_device, src, dst_device, dst, bytes,
+                                            nullptr, stream);
 }
 
 static bool ensure_bf16_staging(DraftFeatureMirror & mirror, size_t elems) {
