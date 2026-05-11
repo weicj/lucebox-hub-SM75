@@ -204,7 +204,6 @@ set(_dflash27b_sources
     src/laguna_target_graph.cpp
     src/laguna_daemon.cpp
     src/sampler.cpp
-    src/prefix_cache.cpp
 )
 # FlashPrefill custom CUDA kernels need CUDA BF16 WMMA (sm_80+). Other CUDA
 # arches and HIP use ggml's flash_attn_ext instead.
