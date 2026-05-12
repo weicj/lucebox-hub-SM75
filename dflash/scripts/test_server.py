@@ -359,6 +359,42 @@ def test_chat_completions_non_streaming(mock_os_read, mock_pipe, mock_tokenizer,
 
 @patch("server.os.pipe")
 @patch("server.os.read")
+@patch("server.subprocess.Popen")
+def test_chat_completions_uses_max_completion_tokens(
+        mock_popen, mock_os_read, mock_pipe, mock_tokenizer):
+    mock_popen.return_value.poll.return_value = None
+    mock_pipe.return_value = (1, 2)
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    app = build_app(
+        target=Path("target.gguf"),
+        draft=Path("draft.safetensors"),
+        bin_path=Path("test_dflash"),
+        budget=22,
+        max_ctx=131072,
+        tokenizer=mock_tokenizer,
+        stop_ids={2},
+    )
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 2,
+        "max_completion_tokens": 7,
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    writes = [
+        call.args[0].decode("utf-8")
+        for call in mock_popen.return_value.stdin.write.call_args_list
+    ]
+    command = next(write for write in writes if write.strip().endswith(" 7"))
+    assert command.strip().split()[1] == "7"
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
 def test_chat_completions_non_streaming_with_tool_call(mock_os_read, mock_pipe,
                                                         mock_tokenizer, app):
     """Non-streaming chat returns tool_calls when model outputs <tool_call>."""
