@@ -11,6 +11,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-e8e8ed?style=for-the-badge&labelColor=090909" alt="Apache 2.0"></a>
   <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12%2B-76b900?style=for-the-badge&logo=nvidia&logoColor=76b900&labelColor=090909" alt="CUDA 12+"></a>
+  <a href="https://rocm.docs.amd.com/projects/HIP/en/latest/"><img src="https://img.shields.io/badge/HIP-7%2B-ed1c24?style=for-the-badge&logo=amd&logoColor=ed1c24&labelColor=090909" alt="HIP 7+"></a>
   <a href="https://isocpp.org"><img src="https://img.shields.io/badge/C%2B%2B-17-e8e8ed?style=for-the-badge&logo=cplusplus&logoColor=e8e8ed&labelColor=090909" alt="C++17"></a>
 </p>
 
@@ -49,6 +50,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
 | RTX 3090 | Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
 | RTX 3090 | Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
 | RTX 5090 | Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR (205 tok/s) |
+| Ryzen AI MAX+ 395 (gfx1151) | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **2.24×** @ 16K | **3.08×** vs llama.cpp HIP AR (37 tok/s) |
 
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
@@ -229,6 +231,32 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 - 4 CUDA kernels (`flashprefill_kernels.cu`) for the FlashPrefill `mean_K / score / select / sparse_fwd` algorithm.
 
 [Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
+
+---
+
+## AMD Strix Halo (HIP backend)
+
+**Same DFlash + PFlash stack on an AMD iGPU.** PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a single Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, gfx1151, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s** DFlash decode on Qwen3.5-27B Q4_K_M, **27.6 s** TTFT at 16K context with NIAH retrieval intact. That is **3.08×** decode and **2.24×** prefill over llama.cpp HIP AR on the same iGPU. End-to-end wall clock at a realistic 16K prompt + 1K generation workload: **2.66×** faster than vanilla llama.cpp.
+
+```bash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+
+# Build for gfx1151 (Strix Halo). Swap the arch for gfx1100 / gfx1201.
+cmake -B build -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build build --target test_dflash -j
+```
+
+`DFLASH27B_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (the path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed).
+
+**Per-arch DDTree tuning**: gfx1151 (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. gfx1100 (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
+
+**Drafter recipe for max decode**: target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `dflash/scripts/quantize_draft_q8.py`. The matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
+
+[Blog post →](https://lucebox.com/blog/amd) · [PR #119 →](https://github.com/Luce-Org/lucebox-hub/pull/119) · [PR #156 cross-arch perf plan →](https://github.com/Luce-Org/lucebox-hub/pull/156)
 
 ---
 
