@@ -174,6 +174,7 @@ struct DraftLayer {
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
+    bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
 };
 
 struct DraftWeights {
@@ -193,6 +194,7 @@ struct DraftWeights {
     int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
+    int swa_window = 0;  // sliding window size (0 = disabled)
 };
 
 bool load_draft_safetensors(const std::string & path,
@@ -480,3 +482,15 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window = 0);
 
 } // namespace dflash27b
+
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+#include <cuda_runtime.h>
+// Host-staged copy between CUDA devices (no peer access required).
+// Streams are device-specific: src_stream orders the D2H leg on src_dev and
+// dst_stream orders the H2D leg on dst_dev. Null streams use each device's
+// default stream. The helper synchronizes before returning.
+bool dflash_cuda_copy_between_devices(int src_dev, const void * src,
+                                      int dst_dev, void * dst, size_t nbytes,
+                                      cudaStream_t src_stream = nullptr,
+                                      cudaStream_t dst_stream = nullptr);
+#endif

@@ -7,7 +7,7 @@ This doc is the build / runtime / tunables reference for the C++ daemon
 path described in [`pflash/README.md`](../../pflash/README.md) and on the
 [blog post](https://lucebox.com/blog/pflash):
 
-- **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_0p6b_*`)
+- **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_*`)
   with the FlashPrefill block-sparse attention kernel for long-context
   scoring.
 - **Target** (Qwen3.6-27B Q4_K_M) loaded directly via ggml.
@@ -51,50 +51,11 @@ DFLASH_FP_PROFILE=1    # log mean/score/select/forward stage timings
 
 See `src/flashprefill.h` for the full list and defaults.
 
-## Dual-GPU PFlash phase split
+## Mixed backend placement
 
-PFlash targets the prefill side of long-context requests. The dual-GPU phase
-split harness is an opt-in benchmark/runtime path for measuring the PFlash
-prefill phase as its own resident CUDA process:
-
-- `pflash_daemon` keeps the Qwen3-0.6B PFlash drafter resident.
-- `scripts/phase_split_dual_gpu.py` sends counted token IDs to the daemon.
-- `--pflash-gpu` selects the CUDA GPU used for the PFlash phase.
-- The report records compressed token/text outputs, PFlash timing, and GPU
-  resource peaks for the PFlash worker.
-
-The harness produces the compressed prompt artifact used by later target
-prefill experiments. It does not measure or modify decode.
-
-Build:
-
-```
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target pflash_daemon -j
-```
-
-Run a synthetic NIAH sweep:
-
-```
-python scripts/phase_split_dual_gpu.py bench-niah \
-  --build-dir build \
-  --contexts 4096,8192,16384 \
-  --local-files-only \
-  --report-dir reports/pflash_phase_split_context_sweep
-```
-
-Compress a real prompt:
-
-```
-python scripts/phase_split_dual_gpu.py run-prompt \
-  --build-dir build \
-  --prompt-file /path/to/prompt.txt \
-  --local-files-only \
-  --report-dir reports/pflash_phase_split_prompt
-```
-
-The reports include source token count, compressed token count, compression
-ratio, PFlash timing, and GPU resource peaks.
+CUDA/HIP mixed backend placement uses separate CUDA and HIP builds at the
+PFlash phase or DFlash draft-process boundary. See
+[`MIXED_BACKEND.md`](MIXED_BACKEND.md) for the build and harness instructions.
 
 ## Performance
 
@@ -120,17 +81,29 @@ src/
   flashprefill_select.cpp       Host fallback for block_select (rarely used)
   bsa_launcher.cu               BSA launcher: blockmask conversion + Flash_fwd_params
   bsa_fwd_inst.cu               Single-TU instantiation of BSA's hdim128 kernel
-  qwen3_0p6b_loader.cpp         GGUF → Qwen3-0.6B BF16 weight tensors
-  qwen3_0p6b_graph.cpp          Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
-  qwen3_drafter.{h,cpp}         drafter_score_and_compress() entry point
-  qwen35_target_graph.cpp       Qwen3.5/3.6 target graph (ggml)
-  qwen3_dflash_graph.cpp        DFlash speculative draft head
+  qwen3/                   Qwen3-0.6B drafter model code
+    qwen3_loader.cpp       GGUF → Qwen3-0.6B BF16 weight tensors
+    qwen3_graph.cpp        Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
+    qwen3_drafter.{h,cpp}       drafter_score_and_compress() entry point
+  qwen35/                       Qwen3.5/3.6 target + DFlash draft model code
+    qwen35_target_graph.cpp     Qwen3.5/3.6 target graph (ggml)
+    gguf_target_loader.cpp      Qwen3.5 target GGUF loader
+  draft/                        Special DFlash draft model code
+    draft_dflash_graph.cpp      DFlash speculative draft head
+    draft_gguf_loader.cpp       Draft GGUF loader
+    draft_safetensors_loader.cpp Draft safetensors loader
+  laguna/                       Laguna target + daemon model code
+    laguna_target_loader.cpp    Laguna GGUF loader
+    laguna_target_graph.cpp     Laguna forward graph
+    laguna_daemon.{h,cpp}       Laguna daemon protocol/runtime
+  common/                       Shared runtime helpers
+    sampler.{h,cpp}             Shared CPU sampler chain
   kv_cache.cpp / kv_quant.cpp   Q4_0 KV cache + asymmetric quant
 test/
   test_dflash.cpp               daemon executable; supports
                                   `compress / generate / park / unpark / free drafter`
   test_flashprefill_kernels.cpp parity tests for the 4 FP kernels
-  smoke_qwen3_0p6b_forward.cpp  drafter forward smoke at S=8K-128K
+  smoke_qwen3_forward.cpp  drafter forward smoke at S=8K-128K
 deps/
   llama.cpp/                    submodule (ggml only; libllama not built)
   Block-Sparse-Attention/       submodule (BSA + cutlass)

@@ -30,11 +30,11 @@
 //   per-ubatch graph transients (chunk_s sized)        ~2-3 GB
 //   total                                              ~20 GB  (fits 24 GB)
 
-#include "qwen3_0p6b_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 #include "flashprefill.h"
 
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
 #include <cuda_runtime.h>
 #endif
 
@@ -98,14 +98,14 @@ inline uint16_t f32_to_f16(float f) {
 
 } // namespace
 
-bool forward_qwen3_0p6b_drafter(
+bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
     std::vector<float> & running_max)
 {
     if (!w.backend || !w.tok_embd) {
-        set_last_error("forward_qwen3_0p6b_drafter: weights not loaded");
+        set_last_error("forward_qwen3_drafter_model: weights not loaded");
         return false;
     }
     const int S        = (int)ids.size();
@@ -119,7 +119,7 @@ bool forward_qwen3_0p6b_drafter(
     const float rope_b = w.rope_theta;
 
     if (S < n_lookahead + 1) {
-        set_last_error("forward_qwen3_0p6b_drafter: S too small");
+        set_last_error("forward_qwen3_drafter_model: S too small");
         return false;
     }
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
@@ -146,9 +146,10 @@ bool forward_qwen3_0p6b_drafter(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 on Ampere+ (native tensor core support), F16 on Turing.
+        // Use BF16 only when the CUDA WMMA fastpath is compiled. Other CUDA
+        // arches and HIP use F16 with ggml flash_attn_ext for the portable path.
         const ggml_type half_type =
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -158,7 +159,7 @@ bool forward_qwen3_0p6b_drafter(
             !make_pers(w.backend, GGML_TYPE_F32,  2, d_mt, mask_tail_buf) ||
             !make_pers(w.backend, half_type, 3, d_q, Q_buf) ||
             !make_pers(w.backend, half_type, 3, d_q, attn_out_buf)) {
-            set_last_error("forward_qwen3_0p6b: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
+            set_last_error("forward_qwen3: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
             cleanup_all();
             return false;
         }
@@ -166,7 +167,7 @@ bool forward_qwen3_0p6b_drafter(
             if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il]) ||
                 !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il]) ||
                 !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
-                set_last_error("forward_qwen3_0p6b: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
+                set_last_error("forward_qwen3: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
             }
@@ -323,18 +324,19 @@ bool forward_qwen3_0p6b_drafter(
 
         // ── Attention dispatch ──
         // Use the ggml FA path (flash_prefill_forward_q8) when:
-        //   - SM < 80 (BF16 WMMA unavailable), OR
-        //   - The drafter's persistent buffers are not BF16 (e.g. F16 on Turing)
-        // Use the custom BF16 WMMA path on SM >= 80 with BF16 buffers.
+        //   - the CUDA BF16 WMMA kernels were not compiled, OR
+        //   - the drafter's persistent buffers are not BF16
+        // Use the custom CUDA BF16 WMMA path only when it is compiled and the
+        // buffers are BF16.
         auto tF0 = std::chrono::steady_clock::now();
         const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
                                  && true;
 #else
                                  && false;  // WMMA kernels not compiled
 #endif
         if (use_bf16_fp) {
-#if DFLASH27B_MIN_SM >= 80
+#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
             int rc = flashprefill::flash_prefill_forward_bf16(
                 Q_buf.t->data,
                 K_curr_v[il].t->data,
@@ -360,7 +362,7 @@ bool forward_qwen3_0p6b_drafter(
                 V_curr_v[il].t->data,
                 attn_out_buf.t->data,
                 1, S, H, Hk, D, scale,
-                (int)ggml_element_size(Q_buf.t),
+                Q_buf.t->type,
                 fp_cfg);
             if (rc != 0) {
                 set_last_error("flash_prefill_forward_q8 failed at layer " + std::to_string(il));

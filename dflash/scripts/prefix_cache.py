@@ -54,10 +54,13 @@ Option 3 — full-compress-result cache:
 """
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import struct
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -73,13 +76,14 @@ class DaemonStdoutBus:
     """
 
     # Prefixes that are too spammy to print in normal operation.
-    _SUPPRESS_PREFIXES = (
+    _DEFAULT_SUPPRESS_PREFIXES = (
         "[step ", "[timing]", "[dflash]", "[prompt]",
         "[prefill]", "[migrate]", "[dbg ", "  ",
     )
 
-    def __init__(self, stdout):
+    def __init__(self, stdout, verbose: bool = False):
         self.stdout = stdout
+        self._suppress_prefixes = () if verbose else self._DEFAULT_SUPPRESS_PREFIXES
         self._waiters: list[tuple[str, asyncio.Future]] = []
         self._task: asyncio.Task | None = None
 
@@ -110,7 +114,7 @@ class DaemonStdoutBus:
 
             if not matched:
                 # Log line — suppress very noisy prefixes.
-                if decoded and not any(decoded.startswith(p) for p in self._SUPPRESS_PREFIXES):
+                if decoded and not any(decoded.startswith(p) for p in self._suppress_prefixes):
                     print(f"  [daemon] {decoded}", flush=True)
 
     async def await_reply(self, prefix: str, timeout: float = 10.0) -> str:
@@ -126,6 +130,16 @@ class DaemonStdoutBus:
             # remove ourselves so _waiters doesn't grow without bound.
             try: self._waiters.remove(entry)
             except ValueError: pass
+
+
+@dataclass
+class FullCacheEntry:
+    slot: int
+    cur_bin_path: str
+    cur_ids_len: int
+    raw_prompt_len: int
+    last_used_ns: int
+    hits: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +438,8 @@ class PrefixCache:
     # configured cap > this is silently clamped down — exceeding it would
     # cause silent SNAPSHOT failures on slots ≥ 8.
     DAEMON_MAX_SLOTS = 8
+    FULL_META_VERSION = 2
+    FULL_META_SUFFIX = ".meta.json"
 
     def __init__(self, *, daemon_stdin, await_reply, daemon_lock,
                  tokenizer, kv_k_type: str, fa_window: int,
@@ -620,7 +636,8 @@ class PrefixCache:
     # ------------------------------------------------------------------
 
     def init_full_cache(self, full_cap: int,
-                        cache_dir: str | None = None) -> None:
+                        cache_dir: str | None = None,
+                        budget_bytes: int = 0) -> None:
         """Initialise the full-cache pool.  Must be called once after __init__
         if you want Option 3 to be active.  Idempotent if called again with
         the same parameters.
@@ -632,7 +649,7 @@ class PrefixCache:
             prefix_cap (self.cap) + full_cap must not exceed DAEMON_MAX_SLOTS.
         cache_dir:
             Directory to persist cur_bin files across requests.
-            Defaults to /tmp/dflash-pflash-cache/.
+            Defaults to /tmp/prefix/.
         """
         if self.disabled or full_cap <= 0:
             self._full_cap = 0
@@ -657,21 +674,296 @@ class PrefixCache:
 
         self._full_cap = full_cap
         self._full_disabled = False
+        self._full_budget_bytes = max(0, int(budget_bytes or 0))
         # Slots used by the full-cache start AFTER the prefix-cache slots.
         self._full_slot_base = self.cap
         self._full_next_slot = 0  # relative; absolute = _full_slot_base + _full_next_slot
-        # LRU map: prompt_ids_hash -> (absolute_slot, cached_cur_bin_path, cur_ids_len)
-        self.full_entries: OrderedDict[bytes, tuple[int, str, int]] = OrderedDict()
+        # Access-ordered map: prompt_ids_hash -> full-cache entry metadata.
+        self.full_entries: OrderedDict[bytes, FullCacheEntry] = OrderedDict()
         # Pending eviction: the LRU entry reserved for the next confirm.
         self._full_pending_evict_key: bytes | None = None
         self._full_pending_evict_path: str | None = None
 
-        cache_dir_path = Path(cache_dir) if cache_dir else Path("/tmp/dflash-pflash-cache")
+        cache_dir_path = Path(cache_dir) if cache_dir else Path("/tmp/prefix")
         cache_dir_path.mkdir(parents=True, exist_ok=True)
         self._full_cache_dir = cache_dir_path
+        budget_msg = (f" budget={self._full_budget_bytes}"
+                      if self._full_budget_bytes > 0 else "")
         print(f"{self.log_prefix} full-cache enabled: cap={full_cap} "
               f"slots=[{self._full_slot_base},{self._full_slot_base + full_cap}) "
-              f"dir={cache_dir_path}", flush=True)
+              f"dir={cache_dir_path}{budget_msg}", flush=True)
+
+    def _full_bin_path(self, key: bytes) -> Path:
+        return self._full_cache_dir / f"{key.hex()}.bin"
+
+    def _full_meta_path(self, key: bytes) -> Path:
+        return self._full_cache_dir / f"{key.hex()}{self.FULL_META_SUFFIX}"
+
+    def _write_json_atomic(self, path: Path, payload: dict) -> None:
+        tmp_path = Path(f"{path}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+        os.replace(tmp_path, path)
+
+    def _persist_full_metadata(self, key: bytes, entry: FullCacheEntry,
+                               *, last_used_ns: int | None = None) -> None:
+        if getattr(self, "_full_disabled", True):
+            return
+        used_ns = int(entry.last_used_ns if last_used_ns is None else last_used_ns)
+        entry.last_used_ns = used_ns
+        meta = {
+            "version": self.FULL_META_VERSION,
+            "key_hex": key.hex(),
+            "kv_k_type": self.kv_k_type,
+            "fa_window": int(self.fa_window or 0),
+            "cur_ids_len": int(entry.cur_ids_len),
+            "raw_prompt_len": int(entry.raw_prompt_len),
+            "last_used_ns": used_ns,
+        }
+        try:
+            self._write_json_atomic(self._full_meta_path(key), meta)
+        except OSError as exc:
+            print(f"{self.log_prefix} full-cache: failed to write metadata for "
+                  f"{key.hex()[:8]}: {exc}", flush=True)
+
+    def _drop_full_metadata(self, key: bytes) -> None:
+        if getattr(self, "_full_disabled", True):
+            return
+        try:
+            self._full_meta_path(key).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"{self.log_prefix} full-cache: failed to remove metadata for "
+                  f"{key.hex()[:8]}: {exc}", flush=True)
+
+    def _full_entry_artifact_size(self, key: bytes, entry: FullCacheEntry) -> int:
+        total = 0
+        for path in (Path(entry.cur_bin_path), self._full_meta_path(key)):
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    @staticmethod
+    def _read_full_meta_int(meta: dict, key: str, *, default: int | None = None) -> int | None:
+        value = meta.get(key, default)
+        if value is None or isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def _recompute_full_next_slot(self) -> None:
+        if getattr(self, "_full_disabled", True) or self._full_cap <= 0:
+            self._full_next_slot = 0
+            return
+        occupied = {
+            entry.slot - self._full_slot_base
+            for entry in self.full_entries.values()
+            if self._full_slot_base <= entry.slot < self._full_slot_base + self._full_cap
+        }
+        for offset in range(self._full_cap):
+            idx = (self._full_next_slot + offset) % self._full_cap
+            if idx not in occupied:
+                self._full_next_slot = idx
+                return
+        self._full_next_slot = 0
+
+    def _reserve_next_free_full_slot(self) -> int | None:
+        if getattr(self, "_full_disabled", True) or self._full_cap <= 0:
+            return None
+        self._recompute_full_next_slot()
+        occupied = {entry.slot for entry in self.full_entries.values()}
+        for offset in range(self._full_cap):
+            idx = (self._full_next_slot + offset) % self._full_cap
+            abs_slot = self._full_slot_base + idx
+            if abs_slot not in occupied:
+                self._full_next_slot = (idx + 1) % self._full_cap
+                return abs_slot
+        return None
+
+    def _full_entry_score(self, key: bytes, entry: FullCacheEntry,
+                          live_prompt_ids: list[int] | None = None) -> float:
+        file_size = self._full_entry_artifact_size(key, entry)
+        if file_size <= 0:
+            return 0.0
+        tokens = entry.raw_prompt_len if entry.raw_prompt_len > 0 else entry.cur_ids_len
+        score = ((float(entry.hits) + 1.0) * float(tokens)) / float(file_size)
+        if live_prompt_ids and self._is_live_prefix_entry(key, entry, live_prompt_ids):
+            depth = float(tokens) / float(len(live_prompt_ids))
+            score *= 0.25 if entry.hits else 0.02
+            score *= depth
+        return score
+
+    def _is_live_prefix_entry(self, key: bytes, entry: FullCacheEntry,
+                              live_prompt_ids: list[int]) -> bool:
+        plen = int(entry.raw_prompt_len or 0)
+        if plen <= 0 or plen >= len(live_prompt_ids):
+            return False
+        live_key = hash_prefix(live_prompt_ids[:plen], self.kv_k_type, self.fa_window)
+        return live_key == key
+
+    def _select_full_victim_from_entries(
+            self,
+            entries: OrderedDict[bytes, FullCacheEntry],
+            live_prompt_ids: list[int] | None = None) -> tuple[bytes, FullCacheEntry] | None:
+        victim: tuple[bytes, FullCacheEntry] | None = None
+        victim_score = 0.0
+        for key, entry in entries.items():
+            score = self._full_entry_score(key, entry, live_prompt_ids)
+            if (victim is None
+                    or score < victim_score
+                    or (score == victim_score and entry.last_used_ns < victim[1].last_used_ns)):
+                victim = (key, entry)
+                victim_score = score
+        return victim
+
+    def _retire_full_entry(self, key: bytes, entry: FullCacheEntry,
+                           *, remove_files: bool = True) -> None:
+        self.full_entries.pop(key, None)
+        if remove_files:
+            try:
+                Path(entry.cur_bin_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._drop_full_metadata(key)
+        self._recompute_full_next_slot()
+
+    def _enforce_full_budget(self, live_prompt_ids: list[int] | None = None) -> None:
+        budget = int(getattr(self, "_full_budget_bytes", 0) or 0)
+        if budget <= 0 or not self.full_entries:
+            return
+        total = sum(self._full_entry_artifact_size(key, entry)
+                    for key, entry in self.full_entries.items())
+        while total > budget and self.full_entries:
+            victim = self._select_full_victim_from_entries(self.full_entries, live_prompt_ids)
+            if victim is None:
+                break
+            victim_key, victim_entry = victim
+            victim_size = self._full_entry_artifact_size(victim_key, victim_entry)
+            victim_score = self._full_entry_score(victim_key, victim_entry, live_prompt_ids)
+            self._retire_full_entry(victim_key, victim_entry, remove_files=True)
+            print(f"{self.log_prefix} full-cache retired key={victim_key.hex()[:8]} "
+                  f"score={victim_score:.6f} "
+                  f"size={victim_size}", flush=True)
+            total = total - victim_size if total >= victim_size else 0
+        self._recompute_full_next_slot()
+
+    def _load_persisted_full_entries(self) -> list[tuple[bytes, FullCacheEntry]]:
+        """Return persisted full-cache entries sorted from LRU → MRU."""
+        if getattr(self, "_full_disabled", True):
+            return []
+
+        entries_by_key: dict[bytes, FullCacheEntry] = {}
+        fa_window = int(self.fa_window or 0)
+        for meta_path in self._full_cache_dir.glob(f"*{self.FULL_META_SUFFIX}"):
+            try:
+                with meta_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, ValueError, TypeError):
+                continue
+
+            if not isinstance(meta, dict):
+                continue
+            version = self._read_full_meta_int(meta, "version", default=0)
+            if version is None:
+                continue
+            if version not in (1, self.FULL_META_VERSION):
+                continue
+            if meta.get("kv_k_type") != self.kv_k_type:
+                continue
+            meta_fa_window = self._read_full_meta_int(meta, "fa_window", default=-1)
+            if meta_fa_window != fa_window:
+                continue
+
+            key_hex = meta.get("key_hex")
+            if not isinstance(key_hex, str):
+                continue
+            try:
+                key = bytes.fromhex(key_hex)
+            except ValueError:
+                continue
+            if len(key) != 16:
+                continue
+            cur_ids_len = self._read_full_meta_int(meta, "cur_ids_len")
+            if cur_ids_len is None or cur_ids_len < 0:
+                continue
+            raw_prompt_len = self._read_full_meta_int(meta, "raw_prompt_len", default=cur_ids_len)
+            if raw_prompt_len is None or raw_prompt_len < 0:
+                continue
+            last_used_ns = self._read_full_meta_int(meta, "last_used_ns", default=0)
+            if last_used_ns is None:
+                continue
+
+            bin_path = self._full_bin_path(key)
+            if not bin_path.exists():
+                continue
+
+            prev = entries_by_key.get(key)
+            record = FullCacheEntry(
+                slot=-1,
+                cur_bin_path=str(bin_path),
+                cur_ids_len=cur_ids_len,
+                raw_prompt_len=raw_prompt_len,
+                last_used_ns=last_used_ns,
+                hits=0,
+            )
+            if prev is None or record.last_used_ns >= prev.last_used_ns:
+                entries_by_key[key] = record
+
+        if entries_by_key and getattr(self, "_full_budget_bytes", 0):
+            self.full_entries = OrderedDict(
+                sorted(entries_by_key.items(), key=lambda item: (item[1].last_used_ns, item[0].hex()))
+            )
+            self._enforce_full_budget()
+            entries_by_key = dict(self.full_entries)
+            self.full_entries.clear()
+
+        return sorted(entries_by_key.items(), key=lambda item: (item[1].last_used_ns, item[0].hex()))
+
+    async def rehydrate_full_cache(self, replay_entry) -> int:
+        """Restore persisted full-cache entries into fresh daemon slots.
+
+        ``replay_entry`` must be an async callable accepting
+        ``(slot, cur_bin_path, cur_ids_len)`` and return ``True`` on success.
+        """
+        if getattr(self, "_full_disabled", True):
+            return 0
+
+        persisted = self._load_persisted_full_entries()
+        if not persisted:
+            self.full_entries.clear()
+            self._full_next_slot = 0
+            return 0
+
+        if len(persisted) > self._full_cap:
+            persisted = persisted[-self._full_cap:]
+
+        self.full_entries.clear()
+        self._full_pending_evict_key = None
+        self._full_pending_evict_path = None
+
+        restored = 0
+        async with self.lock:
+            for key, entry in persisted:
+                slot = self._full_slot_base + restored
+                try:
+                    ok = await replay_entry(slot, entry.cur_bin_path, entry.cur_ids_len)
+                except Exception as exc:
+                    print(f"{self.log_prefix} full-cache: restore failed for "
+                          f"{Path(entry.cur_bin_path).name}: {exc}", flush=True)
+                    ok = False
+                if not ok:
+                    continue
+                entry.slot = slot
+                self.full_entries[key] = entry
+                restored += 1
+                if restored >= self._full_cap:
+                    break
+
+        self._recompute_full_next_slot()
+        if restored:
+            print(f"{self.log_prefix} full-cache restored {restored} entries "
+                  f"from disk", flush=True)
+        return restored
 
     def lookup_full(self, prompt_ids: list[int]) -> tuple[int, str, int] | None:
         """Exact-match on full prompt_ids hash (keyed on raw, pre-compression ids).
@@ -688,12 +980,16 @@ class PrefixCache:
         entry = self.full_entries.get(key)
         if entry is None:
             return None
-        slot, cur_bin_path, cur_ids_len = entry
+        slot, cur_bin_path, cur_ids_len = entry.slot, entry.cur_bin_path, entry.cur_ids_len
         # Verify the cached file still exists (could have been deleted externally).
         if not Path(cur_bin_path).exists():
             self.full_entries.pop(key, None)
+            self._drop_full_metadata(key)
             return None
+        entry.hits += 1
+        entry.last_used_ns = time.time_ns()
         self.full_entries.move_to_end(key)  # mark fresh in LRU
+        self._persist_full_metadata(key, entry)
         print(f"{self.log_prefix} full-cache hit slot={slot} "
               f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
         return slot, cur_bin_path, cur_ids_len
@@ -715,14 +1011,17 @@ class PrefixCache:
 
         # Pick a slot, deferring eviction until confirm succeeds.
         if len(self.full_entries) >= self._full_cap:
-            old_key = next(iter(self.full_entries))
-            old_slot, old_path, _ = self.full_entries[old_key]
+            victim = self._select_full_victim_from_entries(self.full_entries, prompt_ids)
+            if victim is None:
+                return None
+            old_key, old_entry = victim
             self._full_pending_evict_key = old_key
-            self._full_pending_evict_path = old_path
-            abs_slot = old_slot
+            self._full_pending_evict_path = old_entry.cur_bin_path
+            abs_slot = old_entry.slot
         else:
-            abs_slot = self._full_slot_base + self._full_next_slot
-            self._full_next_slot = (self._full_next_slot + 1) % self._full_cap
+            abs_slot = self._reserve_next_free_full_slot()
+            if abs_slot is None:
+                return None
             self._full_pending_evict_key = None
             self._full_pending_evict_path = None
 
@@ -743,7 +1042,7 @@ class PrefixCache:
             return
 
         key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
-        dest = self._full_cache_dir / (key.hex() + ".bin")
+        dest = self._full_bin_path(key)
 
         try:
             shutil.copy2(str(cur_bin_src), str(dest))
@@ -758,13 +1057,25 @@ class PrefixCache:
         # Atomically evict the reserved entry (if any) and insert new one.
         if self._full_pending_evict_key is not None:
             evicted_path = self._full_pending_evict_path
-            self.full_entries.pop(self._full_pending_evict_key, None)
+            evicted_key = self._full_pending_evict_key
+            self.full_entries.pop(evicted_key, None)
             if evicted_path:
                 Path(evicted_path).unlink(missing_ok=True)
+            self._drop_full_metadata(evicted_key)
             self._full_pending_evict_key = None
             self._full_pending_evict_path = None
 
-        self.full_entries[key] = (slot, str(dest), cur_ids_len)
+        entry = FullCacheEntry(
+            slot=slot,
+            cur_bin_path=str(dest),
+            cur_ids_len=cur_ids_len,
+            raw_prompt_len=len(prompt_ids),
+            last_used_ns=time.time_ns(),
+            hits=0,
+        )
+        self.full_entries[key] = entry
+        self._persist_full_metadata(key, entry)
+        self._enforce_full_budget(prompt_ids)
         print(f"{self.log_prefix} full-cache committed slot={slot} "
               f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
 

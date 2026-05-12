@@ -1,8 +1,10 @@
 // ggml flash_attn_ext-based FlashPrefill implementation.
 //
 // Provides flash_prefill_forward_q8() — a portable alternative to the custom
-// BF16 WMMA flashprefill kernels. Uses ggml's built-in flash_attn_ext which
-// works on all SM targets (75+) with FP16/BF16/Q8_0 K/V support.
+// BF16 WMMA flashprefill kernels. Uses ggml's built-in flash_attn_ext. The
+// ggml CUDA/HIP FA kernels require F32 Q/output while still supporting half
+// K/V, so this path widens Q and the temporary attention output inside the
+// graph and copies the result back to the caller's half/F32 output buffer.
 //
 // The attention is run in chunks (CHUNK_S tokens per pass) to keep the
 // causal mask small and the ggml graph allocation bounded. Each chunk
@@ -31,7 +33,7 @@ int flash_prefill_forward_q8(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
     float scale,
-    int elem_size,
+    ggml_type qkv_type,
     const FlashPrefillConfig & cfg)
 {
     (void)cfg;  // block-sparse selection not used in this path
@@ -43,15 +45,13 @@ int flash_prefill_forward_q8(
     const int Hk = n_k_heads;
     const int D  = head_dim;
 
-    // Determine the ggml type from element size.
-    // The caller passes Q/K/V as raw pointers with a known element size.
-    ggml_type qkv_type;
-    if      (elem_size == 2) qkv_type = GGML_TYPE_BF16;  // or F16 — FA handles both
-    else if (elem_size == 4) qkv_type = GGML_TYPE_F32;
-    else {
-        std::fprintf(stderr, "[flashprefill_q8] unsupported elem_size=%d\n", elem_size);
+    if (qkv_type != GGML_TYPE_F16 && qkv_type != GGML_TYPE_BF16
+        && qkv_type != GGML_TYPE_F32) {
+        std::fprintf(stderr, "[flashprefill_q8] unsupported qkv_type=%s\n",
+                     ggml_type_name(qkv_type));
         return -1;
     }
+    const int elem_size = (int)ggml_type_size(qkv_type);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
@@ -99,11 +99,17 @@ int flash_prefill_forward_q8(
         ggml_set_name(O_full, "O_ext");
         ggml_set_output(O_full);
 
-        // Q chunk: [D, H, cl] view, then permute → [D, cl, H] for FA
+        // Q chunk: [D, H, cl] view, then permute -> [D, cl, H] for FA.
+        // ggml-cuda/hip flash_attn_ext requires F32 Q.
         ggml_tensor * Q_chunk = ggml_view_3d(ctx, Q_full, D, H, cl,
                                              esz * D, esz * D * H,
                                              (size_t)cs * esz * D * H);
-        ggml_tensor * Q_fa = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        ggml_tensor * Q_perm = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        ggml_tensor * Q_fa = Q_perm;
+        if (qkv_type != GGML_TYPE_F32) {
+            Q_fa = ggml_cpy(ctx, Q_perm,
+                            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, cl, H));
+        }
 
         // K/V: [D, Hk, kv_len] view, then permute → [D, kv_len, Hk] for FA
         ggml_tensor * K_view = ggml_view_3d(ctx, K_full, D, Hk, kv_len,
@@ -119,8 +125,9 @@ int flash_prefill_forward_q8(
         ggml_set_input(mask);
 
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q_fa, K_fa, V_fa,
-                                                  mask, scale, 0.0f, 0.0f);
-        // FA output: [D, H, cl] (permuted). Copy to O_full at chunk offset.
+                                                 mask, scale, 0.0f, 0.0f);
+        // FA output is F32 [D, H, cl] (permuted). Copy/cast to O_full at
+        // chunk offset so the caller can keep compact half persistent buffers.
         ggml_tensor * O_dst = ggml_view_3d(ctx, O_full, D, H, cl,
                                            esz * D, esz * D * H,
                                            (size_t)cs * esz * D * H);

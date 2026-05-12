@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.18)
-set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-project(dflash27b LANGUAGES C CXX CUDA)
+set(DFLASH27B_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
+set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
+string(TOLOWER "${DFLASH27B_GPU_BACKEND}" DFLASH27B_GPU_BACKEND)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    project(dflash27b LANGUAGES C CXX CUDA)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    project(dflash27b LANGUAGES C CXX)
+else()
+    message(FATAL_ERROR "DFLASH27B_GPU_BACKEND must be 'cuda' or 'hip', got '${DFLASH27B_GPU_BACKEND}'")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,9 +17,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # If we do not set this, ggml will output to bin and DLLs will not load
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-# Bake portable rpath into all executables so bundled libggml-cuda / libggml-base
+# Bake portable rpath into all executables so bundled ggml backend libs / libggml-base
 # are found regardless of LD_LIBRARY_PATH or stale /usr/local/lib (closes #31).
-set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda")
+set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/deps/llama.cpp/ggml/src/ggml-hip;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-hip")
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -20,12 +29,26 @@ endif()
 # ─── ggml (from the llama.cpp submodule) ─────────────────────────────
 #
 # We use only ggml from the vendored llama.cpp submodule. The drafter is
-# loaded via our own custom Qwen3-0.6B forward (qwen3_0p6b_loader.cpp +
-# qwen3_0p6b_graph.cpp) rather than libllama, so libllama is not built.
+# loaded via our own custom Qwen3-0.6B forward
+# (src/qwen3/qwen3_loader.cpp + src/qwen3/qwen3_graph.cpp)
+# rather than libllama, so libllama is not built.
 #
-# Hardcoded for CUDA. No BLAS, no Metal, no Vulkan, no examples/tests/tools.
+# No BLAS, no Metal, no Vulkan, no examples/tests/tools.
 
-set(GGML_CUDA         ON  CACHE BOOL "" FORCE)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    set(GGML_HIP  OFF CACHE BOOL "" FORCE)
+    set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+    set(GGML_HIP  ON  CACHE BOOL "" FORCE)
+    set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    set(DFLASH27B_GGML_BACKEND_TARGET ggml-hip)
+    set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
+    if(DFLASH27B_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "${DFLASH27B_HIP_ARCHITECTURES}" CACHE STRING "" FORCE)
+    endif()
+endif()
 set(GGML_BACKEND_DL   OFF CACHE BOOL "" FORCE)
 set(GGML_METAL        OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN       OFF CACHE BOOL "" FORCE)
@@ -46,27 +69,29 @@ option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
 
 # Resolve the CUDA architecture list up-front so downstream logic (notably
-# the consumer-Blackwell ggml workaround below) can inspect the actual
-# arches nvcc will compile for. The dflash27b target itself is created
-# later; its CUDA_ARCHITECTURES property is applied via
-# set_target_properties once the target exists.
-#
-# Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
-# (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
-# GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
-if(DFLASH27B_USER_CUDA_ARCHITECTURES)
-    set(_dflash27b_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
+# the consumer-Blackwell ggml workaround below) can inspect the actual arches
+# nvcc will compile for. HIP builds use the portable ggml flash_attn_ext path
+# for the PFlash drafter and set the local CUDA-kernel feature level to 0.
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
+    # (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
+    # GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
+    if(DFLASH27B_USER_CUDA_ARCHITECTURES)
+        set(_dflash27b_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
+    else()
+        set(_dflash27b_archs "75;86")
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND _dflash27b_archs "120")
+        endif()
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+            list(APPEND _dflash27b_archs "110")
+        endif()
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
+            list(APPEND _dflash27b_archs "121")
+        endif()
+    endif()
 else()
-    set(_dflash27b_archs "75;86")
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
-        list(APPEND _dflash27b_archs "120")
-    endif()
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
-        list(APPEND _dflash27b_archs "110")
-    endif()
-    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
-        list(APPEND _dflash27b_archs "121")
-    endif()
+    set(_dflash27b_archs "")
 endif()
 
 # Consumer Blackwell workaround: skip sm_12x→sm_12xa replacement and FP4
@@ -80,7 +105,7 @@ if(DFLASH27B_USE_BLACKWELL_CONSUMER_FIX)
     set(_dflash_is_consumer_blackwell ON)
 endif()
 
-if(NOT DEFINED _dflash_is_consumer_blackwell)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND NOT DEFINED _dflash_is_consumer_blackwell)
     set(_dflash_is_consumer_blackwell OFF)
     # Iterate the resolved dflash27b arch list, not raw CMAKE_CUDA_ARCHITECTURES,
     # which is empty on the default path (the project supplies its own list above).
@@ -93,73 +118,111 @@ if(NOT DEFINED _dflash_is_consumer_blackwell)
     endforeach()
 endif()
 
-if(_dflash_is_consumer_blackwell)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_is_consumer_blackwell)
     set(GGML_CUDA_BLACKWELL_CONSUMER ON CACHE BOOL
         "Skip sm_12X→sm_12Xa for consumer Blackwell (no FP4)" FORCE)
 endif()
 # Use only the ggml subtree of llama.cpp (skip libllama).
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
-# The C++ sources include <cuda_runtime.h> directly, so the toolkit headers must
-# be available when compiling the library.
-find_package(CUDAToolkit REQUIRED)
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    # The vendored ggml HIP shim still uses a few CUDA spellings that are not
+    # mapped in this submodule snapshot. Keep the compatibility layer in this
+    # repo so the parent PR is reproducible without a dirty submodule checkout.
+    target_compile_definitions(ggml-hip PRIVATE
+        cublasSgemmStridedBatched=hipblasSgemmStridedBatched
+        cudaStreamCaptureStatus=hipStreamCaptureStatus
+        cudaStreamCaptureStatusNone=hipStreamCaptureStatusNone
+        cudaStreamIsCapturing=hipStreamIsCapturing
+    )
+    target_include_directories(ggml-hip BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/hip_compat)
+endif()
+
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # The CUDA-only sources include <cuda_runtime.h> directly, so the toolkit
+    # headers must be available when compiling the library.
+    find_package(CUDAToolkit REQUIRED)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    find_package(hip REQUIRED)
+endif()
 
 # ─── dflash27b static library ──────────────────────────────────────
 
+set(DFLASH27B_SRC_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/draft
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+)
+
 add_library(dflash27b STATIC
     src/errors.cpp
-    src/gguf_target_loader.cpp
-    src/gguf_draft_loader.cpp
-    src/safetensors_draft.cpp
-    src/qwen35_target_graph.cpp
-    src/qwen3_dflash_graph.cpp
-    src/qwen3_drafter.cpp
-    src/qwen3_0p6b_loader.cpp
-    src/qwen3_0p6b_graph.cpp
+    src/qwen35/gguf_target_loader.cpp
+    src/qwen35/qwen35_target_graph.cpp
+    src/draft/draft_gguf_loader.cpp
+    src/draft/draft_safetensors_loader.cpp
+    src/draft/draft_dflash_graph.cpp
+    src/qwen3/qwen3_drafter.cpp
+    src/qwen3/qwen3_loader.cpp
+    src/qwen3/qwen3_graph.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
     # Laguna-XS.2 (Poolside) target arch
-    src/laguna_target_loader.cpp
-    src/laguna_target_graph.cpp
-    src/laguna_daemon.cpp
-    src/sampler.cpp
+    src/laguna/laguna_target_loader.cpp
+    src/laguna/laguna_target_graph.cpp
+    src/laguna/laguna_daemon.cpp
+    src/common/sampler.cpp
 )
-# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
-# the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
+# FlashPrefill custom CUDA kernels need CUDA BF16 WMMA (sm_80+). Other CUDA
+# arches and HIP use ggml's flash_attn_ext instead.
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
-# run the spec-prefill stack or are building for sm<80 (cutlass BSA kernels
-# need sm_80+; the auto-detect below also disables BSA on legacy arches).
+# run the spec-prefill stack or are building without CUDA BF16 WMMA support
+# (cutlass BSA kernels need sm_80+; the auto-detect below also disables BSA on
+# legacy CUDA arches).
 if(NOT DEFINED DFLASH27B_ENABLE_BSA)
     set(DFLASH27B_ENABLE_BSA ON)
 endif()
 
-# Apply the arch list resolved above (before add_subdirectory, so the
-# consumer-Blackwell workaround can inspect it) to the dflash27b target.
-set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+# Apply the CUDA arch list to local CUDA sources. HIP builds do not have a CUDA
+# SM level; they use the backend-portable ggml flash_attn_ext path and pass
+# CMAKE_HIP_ARCHITECTURES through to the HIP toolchain/ggml backend.
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_sources(dflash27b PRIVATE src/cuda_cross_device_copy.cpp)
+    set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
+    list(GET _dflash27b_archs 0 _dflash27b_cuda_min_sm)
+    # Strip any trailing 'a' suffix (e.g. "121a" -> "121")
+    string(REGEX REPLACE "[^0-9]" "" _dflash27b_cuda_min_sm "${_dflash27b_cuda_min_sm}")
+    target_compile_definitions(dflash27b PRIVATE
+        DFLASH27B_BACKEND_CUDA=1
+        DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
+else()
+    target_compile_definitions(dflash27b PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+endif()
 
-# Extract the minimum SM from the arch list so safetensors_draft.cpp can decide
-# at compile time whether to convert BF16 draft weights to FP16 (cuBLAS BF16
-# GEMM has no tensor core acceleration on SM < 80).
-list(GET _dflash27b_archs 0 _dflash27b_min_sm)
-# Strip any trailing 'a' suffix (e.g. "121a" → "121")
-string(REGEX REPLACE "[^0-9]" "" _dflash27b_min_sm "${_dflash27b_min_sm}")
-target_compile_definitions(dflash27b PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
-
-# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+).
-# On sm_75 the drafter falls back to ggml's flash_attn_ext (see qwen3_0p6b_graph.cpp).
-if(_dflash27b_min_sm GREATER_EQUAL 80)
+# FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). Other CUDA arches
+# and all HIP builds fall back to ggml's flash_attn_ext (see qwen3_graph.cpp).
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80)
     target_sources(dflash27b PRIVATE
         src/flashprefill_kernels.cu
         src/flashprefill_select.cpp
         src/flashprefill.cpp)
-    target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_FLASHPREFILL=1)
+    target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1)
 endif()
 
 # BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
 # on legacy arches with a clear message instead of failing the link.
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA)
+    message(WARNING
+        "DFLASH27B_ENABLE_BSA=ON requested with DFLASH27B_GPU_BACKEND=hip; "
+        "disabling BSA because the bundled implementation is CUDA/CUTLASS-only.")
+    set(DFLASH27B_ENABLE_BSA OFF)
+endif()
 if(DFLASH27B_ENABLE_BSA)
     foreach(_arch IN LISTS _dflash27b_archs)
         if(_arch LESS 80)
@@ -191,9 +254,12 @@ target_include_directories(dflash27b
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CUDAToolkit_INCLUDE_DIRS}
+        ${DFLASH27B_SRC_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
 )
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_include_directories(dflash27b PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
 if(DFLASH27B_ENABLE_BSA)
     target_include_directories(dflash27b PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/bsa_stubs
@@ -212,9 +278,12 @@ endif()
 target_link_libraries(dflash27b
     PUBLIC
         ggml
-        ggml-cuda
+        ${DFLASH27B_GGML_BACKEND_TARGET}
         ggml-base
 )
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_link_libraries(dflash27b PRIVATE hip::host)
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
      target_compile_options(dflash27b PRIVATE
@@ -230,22 +299,22 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     add_executable(pflash_daemon test/pflash_daemon.cpp)
-    target_include_directories(pflash_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(pflash_daemon PRIVATE dflash27b ggml ggml-cuda)
+    target_include_directories(pflash_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(pflash_daemon PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 if(DFLASH27B_TESTS)
-    if(_dflash27b_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash27b CUDA::cudart)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)
-        target_include_directories(test_kv_quant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_kv_quant PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_kv_quant PRIVATE dflash27b)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
@@ -254,87 +323,122 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
-        target_include_directories(smoke_load_draft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_load_draft PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(smoke_load_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_load_draft PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_thin_copy.cpp")
         add_executable(spike_thin_copy test/spike_thin_copy.cpp)
-        target_include_directories(spike_thin_copy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(spike_thin_copy PRIVATE ggml ggml-cuda)
+        target_include_directories(spike_thin_copy PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(spike_thin_copy PRIVATE ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_draft_graph.cpp")
         add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)
-        target_include_directories(smoke_draft_graph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_draft_graph PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(smoke_draft_graph PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_draft_graph PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_0p6b_forward.cpp")
-        add_executable(smoke_qwen3_0p6b_forward test/smoke_qwen3_0p6b_forward.cpp)
-        target_include_directories(smoke_qwen3_0p6b_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_qwen3_0p6b_forward PRIVATE dflash27b ggml ggml-cuda)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_forward.cpp")
+        add_executable(smoke_qwen3_forward test/smoke_qwen3_forward.cpp)
+        target_include_directories(smoke_qwen3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_qwen3_forward PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
-        target_include_directories(test_vs_oracle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_vs_oracle PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(test_vs_oracle PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_vs_oracle PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target.cpp")
         add_executable(smoke_load_target test/smoke_load_target.cpp)
-        target_include_directories(smoke_load_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(smoke_load_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
         add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
-        target_include_directories(smoke_load_target_laguna PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_load_target_laguna PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_target_laguna PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
         add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
-        target_include_directories(smoke_laguna_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_laguna_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_laguna_forward PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_ttft.cpp")
         add_executable(bench_laguna_ttft test/bench_laguna_ttft.cpp)
-        target_include_directories(bench_laguna_ttft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_ttft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_ttft PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_pflash.cpp")
         add_executable(bench_laguna_pflash test/bench_laguna_pflash.cpp)
-        target_include_directories(bench_laguna_pflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_pflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_pflash PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_generate.cpp")
         add_executable(bench_laguna_generate test/bench_laguna_generate.cpp)
-        target_include_directories(bench_laguna_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_generate PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
-        target_include_directories(test_laguna_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_laguna_daemon PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)
-        target_include_directories(smoke_target_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_target_forward PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(smoke_target_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_target_forward PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_generate.cpp")
         add_executable(test_generate test/test_generate.cpp)
-        target_include_directories(test_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_generate PRIVATE dflash27b ggml ggml-cuda)
+        target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_generate PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
-        target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_dflash PRIVATE dflash27b ggml ggml-cuda)
-        # test_dflash uses cudaMemcpyAsync / cudaMemcpy2DAsync directly for the
-        # --fast-rollback path (per-step SSM intermediate state commit). Needs
-        # the CUDA runtime on its own link line.
-        find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(test_dflash PRIVATE CUDA::cudart)
+        target_include_directories(test_dflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_dflash PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_dflash PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
+        endif()
+        target_link_libraries(test_dflash PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        # test_dflash uses cuda*/hip* runtime calls directly for fast rollback,
+        # peer access, and target-layer split copies. Link the selected runtime.
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_dflash PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_dflash PRIVATE hip::host)
+        endif()
         # OpenMP for parallel CPU top-K extraction in the ddtree path.
         find_package(OpenMP)
         if(OpenMP_CXX_FOUND)
             target_link_libraries(test_dflash PRIVATE OpenMP::OpenMP_CXX)
         endif()
+    endif()
+
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link
+    # CUDA::cudart so the toolkit headers are on the compile line (same as
+    # test_dflash historically had alone).
+    set(_dflash_internal_h_cuda_tests
+        smoke_load_draft
+        smoke_draft_graph
+        test_vs_oracle
+        smoke_load_target
+        smoke_load_target_laguna
+        smoke_laguna_forward
+        bench_laguna_ttft
+        bench_laguna_pflash
+        bench_laguna_generate
+        smoke_target_forward
+        test_generate
+        test_dflash
+    )
+    foreach(_t IN LISTS _dflash_internal_h_cuda_tests)
+        if(TARGET ${_t})
+            target_link_libraries(${_t} PRIVATE CUDA::cudart)
+        endif()
+    endforeach()
     endif()
 endif()

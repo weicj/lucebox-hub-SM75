@@ -1,8 +1,8 @@
 // Qwen3-0.6B drafter for pflash speculative prefill, hosted in-process.
 //
 // Wires three pieces:
-//   - qwen3_0p6b_loader.cpp : mmap GGUF + populate ggml tensors on backend
-//   - qwen3_0p6b_graph.cpp  : custom forward (per-layer ggml + FP CUDA kernel)
+//   - qwen3_loader.cpp : mmap GGUF + populate ggml tensors on backend
+//   - qwen3_graph.cpp  : custom forward (per-layer ggml + FP CUDA kernel)
 //   - chunk-top-K + span merge (this file)
 //
 // Single-pass forward at full S using a custom Qwen3-0.6B graph with the
@@ -14,7 +14,7 @@
 // mean-over-lookahead, smoothed with AvgPool, scored per chunk, top-K kept.
 
 #include "qwen3_drafter.h"
-#include "qwen3_0p6b_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 
 #include "ggml.h"
@@ -55,7 +55,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         }
     }
 
-    if (!load_qwen3_0p6b_drafter(gguf_path, out.backend, out.weights)) {
+    if (!load_qwen3_drafter_model(gguf_path, out.backend, out.weights)) {
         // last_error already set by loader
         return false;
     }
@@ -73,7 +73,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 
 void free_drafter(DrafterContext & ctx) {
     if (ctx.loaded) {
-        free_qwen3_0p6b_drafter(ctx.weights);
+        free_qwen3_drafter_model(ctx.weights);
     }
     if (ctx.backend) {
         ggml_backend_free(ctx.backend);
@@ -102,7 +102,7 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_0p6b_drafter(ctx.weights, ids, n_lookahead, running_max)) {
+    if (!forward_qwen3_drafter_model(ctx.weights, ids, n_lookahead, running_max)) {
         return {};
     }
     auto t1 = std::chrono::steady_clock::now();
