@@ -6,10 +6,10 @@
 // without touching the daemon.
 //
 // Usage:
-//   smoke_qwen3_0p6b_forward <gguf_path> <seq_len_or_FILE:path> [keep_ratio]
+//   smoke_qwen3_forward <gguf_path> <seq_len_or_FILE:path> [keep_ratio]
 // Examples:
-//   smoke_qwen3_0p6b_forward .../Qwen3-0.6B-BF16.gguf 140000 0.02
-//   smoke_qwen3_0p6b_forward .../Qwen3-0.6B-BF16.gguf FILE:/tmp/niah_32k.bin 0.05
+//   smoke_qwen3_forward .../Qwen3-0.6B-BF16.gguf 140000 0.02
+//   smoke_qwen3_forward .../Qwen3-0.6B-BF16.gguf FILE:/tmp/niah_32k.bin 0.05
 //
 // Token file format: little-endian u32 count, then count int32 token IDs.
 

@@ -30,7 +30,7 @@
 //   per-ubatch graph transients (chunk_s sized)        ~2-3 GB
 //   total                                              ~20 GB  (fits 24 GB)
 
-#include "qwen3_0p6b_drafter.h"
+#include "qwen3_model_drafter.h"
 #include "internal.h"
 #include "flashprefill.h"
 
@@ -98,14 +98,14 @@ inline uint16_t f32_to_f16(float f) {
 
 } // namespace
 
-bool forward_qwen3_0p6b_drafter(
+bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
     std::vector<float> & running_max)
 {
     if (!w.backend || !w.tok_embd) {
-        set_last_error("forward_qwen3_0p6b_drafter: weights not loaded");
+        set_last_error("forward_qwen3_drafter_model: weights not loaded");
         return false;
     }
     const int S        = (int)ids.size();
@@ -119,7 +119,7 @@ bool forward_qwen3_0p6b_drafter(
     const float rope_b = w.rope_theta;
 
     if (S < n_lookahead + 1) {
-        set_last_error("forward_qwen3_0p6b_drafter: S too small");
+        set_last_error("forward_qwen3_drafter_model: S too small");
         return false;
     }
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
@@ -159,7 +159,7 @@ bool forward_qwen3_0p6b_drafter(
             !make_pers(w.backend, GGML_TYPE_F32,  2, d_mt, mask_tail_buf) ||
             !make_pers(w.backend, half_type, 3, d_q, Q_buf) ||
             !make_pers(w.backend, half_type, 3, d_q, attn_out_buf)) {
-            set_last_error("forward_qwen3_0p6b: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
+            set_last_error("forward_qwen3: persistent alloc failed (hidden/pos/mask/Q/attn_out)");
             cleanup_all();
             return false;
         }
@@ -167,7 +167,7 @@ bool forward_qwen3_0p6b_drafter(
             if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il]) ||
                 !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il]) ||
                 !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
-                set_last_error("forward_qwen3_0p6b: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
+                set_last_error("forward_qwen3: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
             }

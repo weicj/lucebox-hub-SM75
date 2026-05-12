@@ -3,7 +3,7 @@
 // Hosted in the SAME process / SAME ggml allocator as the dflash target, so
 // we never pay the cross-process VRAM contention that broke the Python
 // subprocess integration. Drafter uses our custom Qwen3-0.6B forward
-// (qwen3_0p6b_graph.cpp + qwen3_0p6b_loader.cpp) which calls our FlashPrefill
+// (qwen3_graph.cpp + qwen3_loader.cpp) which calls our FlashPrefill
 // CUDA kernels for the attention compute, replacing libllama. This removes
 // the dense O(S²) FA cost that made libllama 3+ minutes at 140K.
 //
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "qwen3_0p6b_drafter.h"
+#include "qwen3_model_drafter.h"
 
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;

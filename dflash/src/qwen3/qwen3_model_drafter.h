@@ -5,9 +5,9 @@
 // Triton, no subprocess.
 //
 // Public API:
-//   bool load_qwen3_0p6b_drafter(path, backend, out)  → load GGUF weights
-//   bool forward_qwen3_0p6b_drafter(weights, ids, out_q_capture, out_k_capture)
-//   void free_qwen3_0p6b_drafter(weights)
+//   bool load_qwen3_drafter_model(path, backend, out)  → load GGUF weights
+//   bool forward_qwen3_drafter_model(weights, ids, out_q_capture, out_k_capture)
+//   void free_qwen3_drafter_model(weights)
 //
 // Status (2026-04-29 session): scaffolding written; full graph + integration
 // is multi-hour work, in progress.
@@ -64,11 +64,11 @@ struct Qwen3DrafterWeights {
     float rope_theta = 1000000.0f;
 };
 
-bool load_qwen3_0p6b_drafter(const std::string & gguf_path,
+bool load_qwen3_drafter_model(const std::string & gguf_path,
                               ggml_backend_t backend,
                               Qwen3DrafterWeights & out);
 
-void free_qwen3_0p6b_drafter(Qwen3DrafterWeights & w);
+void free_qwen3_drafter_model(Qwen3DrafterWeights & w);
 
 // Custom Qwen3-0.6B forward, fused with Liu Q-hook tail attention scoring.
 //
@@ -83,7 +83,7 @@ void free_qwen3_0p6b_drafter(Qwen3DrafterWeights & w);
 //                 Caller does AvgPool + chunk-top-K + span merge.
 //
 // Returns true on success. On failure sets last_error and returns false.
-bool forward_qwen3_0p6b_drafter(
+bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,

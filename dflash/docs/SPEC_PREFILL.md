@@ -7,7 +7,7 @@ This doc is the build / runtime / tunables reference for the C++ daemon
 path described in [`pflash/README.md`](../../pflash/README.md) and on the
 [blog post](https://lucebox.com/blog/pflash):
 
-- **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_0p6b_*`)
+- **Drafter** (Qwen3-0.6B) loaded via a custom forward (`qwen3_*`)
   with the FlashPrefill block-sparse attention kernel for long-context
   scoring.
 - **Target** (Qwen3.6-27B Q4_K_M) loaded directly via ggml.
@@ -81,17 +81,29 @@ src/
   flashprefill_select.cpp       Host fallback for block_select (rarely used)
   bsa_launcher.cu               BSA launcher: blockmask conversion + Flash_fwd_params
   bsa_fwd_inst.cu               Single-TU instantiation of BSA's hdim128 kernel
-  qwen3_0p6b_loader.cpp         GGUF → Qwen3-0.6B BF16 weight tensors
-  qwen3_0p6b_graph.cpp          Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
-  qwen3_drafter.{h,cpp}         drafter_score_and_compress() entry point
-  qwen35_target_graph.cpp       Qwen3.5/3.6 target graph (ggml)
-  qwen3_dflash_graph.cpp        DFlash speculative draft head
+  qwen3/                   Qwen3-0.6B drafter model code
+    qwen3_loader.cpp       GGUF → Qwen3-0.6B BF16 weight tensors
+    qwen3_graph.cpp        Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
+    qwen3_drafter.{h,cpp}       drafter_score_and_compress() entry point
+  qwen35/                       Qwen3.5/3.6 target + DFlash draft model code
+    qwen35_target_graph.cpp     Qwen3.5/3.6 target graph (ggml)
+    gguf_target_loader.cpp      Qwen3.5 target GGUF loader
+  draft/                        Special DFlash draft model code
+    qwen3_dflash_graph.cpp      DFlash speculative draft head
+    gguf_draft_loader.cpp       Draft GGUF loader
+    safetensors_draft.cpp       Draft safetensors loader
+  laguna/                       Laguna target + daemon model code
+    laguna_target_loader.cpp    Laguna GGUF loader
+    laguna_target_graph.cpp     Laguna forward graph
+    laguna_daemon.{h,cpp}       Laguna daemon protocol/runtime
+  common/                       Shared runtime helpers
+    sampler.{h,cpp}             Shared CPU sampler chain
   kv_cache.cpp / kv_quant.cpp   Q4_0 KV cache + asymmetric quant
 test/
   test_dflash.cpp               daemon executable; supports
                                   `compress / generate / park / unpark / free drafter`
   test_flashprefill_kernels.cpp parity tests for the 4 FP kernels
-  smoke_qwen3_0p6b_forward.cpp  drafter forward smoke at S=8K-128K
+  smoke_qwen3_forward.cpp  drafter forward smoke at S=8K-128K
 deps/
   llama.cpp/                    submodule (ggml only; libllama not built)
   Block-Sparse-Attention/       submodule (BSA + cutlass)
