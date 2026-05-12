@@ -2300,8 +2300,19 @@ def main():
     ap.add_argument("--verbose-daemon", action="store_true",
                     help="Print all daemon stdout lines, including suppressed "
                          "timing and per-step diagnostics.")
-    ap.add_argument("--prefix-cache-slots", type=int, default=4)
-    ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    # Defaults sized for 24 GB consumer GPUs (RTX 3090/4090).
+    # Each snapshot slot allocates a full max_ctx-sized KV mirror in F16:
+    # ~570 MiB at max_ctx=16000, ~1.85 GiB rollback alloc on first long prompt.
+    # On a 3090 the headroom after weights + main KV + verify/rollback buffers
+    # is ~1-3 GiB, so the previous default of 4+4 = 8 slots reliably OOMed (#114).
+    # Set higher manually if you have an A6000/A100 or are running a smaller model.
+    ap.add_argument("--prefix-cache-slots", type=int, default=1,
+                    help="Snapshot slots for system-prompt prefix cache. "
+                         "Default 1 fits 24 GB GPUs; raise on bigger cards.")
+    ap.add_argument("--prefill-cache-slots", type=int, default=0,
+                    help="Snapshot slots for full-prompt prefill cache (pFlash). "
+                         "Default 0 = disabled to keep VRAM headroom; raise if you "
+                         "have spare VRAM and want pFlash full-prompt caching.")
     ap.add_argument("--prefill-cache-bytes", type=int, default=0,
                     help="Disk budget in bytes for persisted full-cache artifacts. "
                          "0 disables budget trimming.")
