@@ -162,9 +162,9 @@ add_library(dflash27b STATIC
     src/errors.cpp
     src/qwen35/gguf_target_loader.cpp
     src/qwen35/qwen35_target_graph.cpp
-    src/draft/gguf_draft_loader.cpp
-    src/draft/safetensors_draft.cpp
-    src/draft/qwen3_dflash_graph.cpp
+    src/draft/draft_gguf_loader.cpp
+    src/draft/draft_safetensors_loader.cpp
+    src/draft/draft_dflash_graph.cpp
     src/qwen3/qwen3_drafter.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp

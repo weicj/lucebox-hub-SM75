@@ -30,7 +30,7 @@
 //   per-ubatch graph transients (chunk_s sized)        ~2-3 GB
 //   total                                              ~20 GB  (fits 24 GB)
 
-#include "qwen3_model_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 #include "flashprefill.h"
 

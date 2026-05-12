@@ -1,8 +1,8 @@
 // Loads a DFlash draft model from a GGUF file on disk into a ggml context
 // on the CUDA backend.
 //
-// This is the Q8_0-quantized counterpart of safetensors_draft.cpp. The draft
-// graph builder (qwen3_dflash_graph.cpp) doesn't care about tensor storage
+// This is the Q8_0-quantized counterpart of draft_safetensors_loader.cpp. The
+// draft graph builder (draft_dflash_graph.cpp) doesn't care about tensor storage
 // types — ggml's ggml_mul_mat handles Q8_0 × F32 dequantization transparently.
 //
 // GGUF arch: "qwen35-dflash-draft" (from convert_dflash_to_gguf.py /

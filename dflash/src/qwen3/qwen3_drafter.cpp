@@ -14,7 +14,7 @@
 // mean-over-lookahead, smoothed with AvgPool, scored per chunk, top-K kept.
 
 #include "qwen3_drafter.h"
-#include "qwen3_model_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 
 #include "ggml.h"

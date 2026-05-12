@@ -22,7 +22,7 @@
 // We mmap the GGUF file and copy each tensor's bytes to the backend buffer
 // (mirrors the dflash gguf_target_loader pattern).
 
-#include "qwen3_model_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 
 #include <cstdio>

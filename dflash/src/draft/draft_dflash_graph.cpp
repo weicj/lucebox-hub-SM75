@@ -29,7 +29,7 @@
 //   - h = rms_norm(h) * norm
 
 #include "internal.h"
-#include "dflash_graph.h"
+#include "draft_graph.h"
 
 #include <cmath>
 

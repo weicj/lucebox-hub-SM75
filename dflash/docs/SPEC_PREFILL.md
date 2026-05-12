@@ -89,9 +89,9 @@ src/
     qwen35_target_graph.cpp     Qwen3.5/3.6 target graph (ggml)
     gguf_target_loader.cpp      Qwen3.5 target GGUF loader
   draft/                        Special DFlash draft model code
-    qwen3_dflash_graph.cpp      DFlash speculative draft head
-    gguf_draft_loader.cpp       Draft GGUF loader
-    safetensors_draft.cpp       Draft safetensors loader
+    draft_dflash_graph.cpp      DFlash speculative draft head
+    draft_gguf_loader.cpp       Draft GGUF loader
+    draft_safetensors_loader.cpp Draft safetensors loader
   laguna/                       Laguna target + daemon model code
     laguna_target_loader.cpp    Laguna GGUF loader
     laguna_target_graph.cpp     Laguna forward graph

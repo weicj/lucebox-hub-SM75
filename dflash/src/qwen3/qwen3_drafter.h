@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "qwen3_model_drafter.h"
+#include "qwen3_drafter_model.h"
 
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
