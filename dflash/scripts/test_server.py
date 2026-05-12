@@ -387,6 +387,51 @@ def test_chat_completions_non_streaming_with_tool_call(mock_os_read, mock_pipe,
 
 @patch("server.os.pipe")
 @patch("server.os.read")
+def test_chat_completions_replays_raw_tool_call_text(mock_os_read, mock_pipe,
+                                                     mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    raw_tool_text = (
+        "Before\n"
+        "<tool_call>"
+        "<function=read_file><parameter=path>test.py</parameter></function>"
+        "</tool_call>\n"
+        "After"
+    )
+    mock_tokenizer.decode.side_effect = [raw_tool_text, "followup"]
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10), struct.pack("<i", -1),
+        struct.pack("<i", 11), struct.pack("<i", -1),
+    ]
+
+    client = TestClient(app)
+    first = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "read test.py"}],
+        "stream": False,
+    })
+    assert first.status_code == 200
+    assistant_msg = first.json()["choices"][0]["message"]
+
+    second = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "user", "content": "read test.py"},
+            assistant_msg,
+            {"role": "tool", "tool_call_id": assistant_msg["tool_calls"][0]["id"], "content": "file body"},
+            {"role": "user", "content": "what next?"},
+        ],
+        "stream": False,
+    })
+    assert second.status_code == 200
+
+    msgs = mock_tokenizer.apply_chat_template.call_args_list[-1][0][0]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["content"] == raw_tool_text
+    assert "tool_calls" not in assistant
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
 def test_zero_token_prompt_is_rejected_before_daemon(
         mock_os_read, mock_pipe, mock_tokenizer, app):
     mock_pipe.return_value = (1, 2)
@@ -457,6 +502,70 @@ def test_chat_completions_streaming_ignores_stray_think_closers(
     text = response.text
     assert "</think>" not in text
     assert '"content":"8"' in text or '"content": "8"' in text
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_chat_completions_streaming_replays_exact_raw_text_with_reasoning(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    raw_tool_turn = (
+        "<think>private chain</think>"
+        "visible"
+        "<tool_call>"
+        "<function=read_file><parameter=path>x.py</parameter></function>"
+        "</tool_call>"
+    )
+    mock_tokenizer.decode.side_effect = [
+        "<think>private chain",
+        "</think>",
+        "visible",
+        "<tool_call><function=read_file><parameter=path>x.py</parameter></function></tool_call>",
+        "followup",
+    ]
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10), struct.pack("<i", 11),
+        struct.pack("<i", 12), struct.pack("<i", 13), struct.pack("<i", -1),
+        struct.pack("<i", 14), struct.pack("<i", -1),
+    ]
+
+    client = TestClient(app)
+    first = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "read x.py"}],
+        "stream": True,
+    })
+    assert first.status_code == 200
+    chunks = [
+        json.loads(line[6:])
+        for line in first.text.strip().split("\n\n")
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_delta = next(
+        c["choices"][0]["delta"]["tool_calls"][0]
+        for c in chunks
+        if c["choices"][0]["delta"].get("tool_calls")
+    )
+
+    second = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "user", "content": "read x.py"},
+            {"role": "assistant", "tool_calls": [{
+                "id": tool_delta["id"],
+                "type": "function",
+                "function": tool_delta["function"],
+            }]},
+            {"role": "tool", "tool_call_id": tool_delta["id"], "content": "file body"},
+            {"role": "user", "content": "what next?"},
+        ],
+        "stream": False,
+    })
+    assert second.status_code == 200
+
+    msgs = mock_tokenizer.apply_chat_template.call_args_list[-1][0][0]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["content"] == raw_tool_turn
+    assert "tool_calls" not in assistant
 
 
 # ─── POST /v1/responses ───────────────────────────────────────────
@@ -672,7 +781,7 @@ def test_responses_object_tool_choice(mock_os_read, mock_pipe,
 @patch("server.os.pipe")
 @patch("server.os.read")
 def test_responses_function_call_output(mock_os_read, mock_pipe,
-                                         mock_tokenizer, app):
+                                          mock_tokenizer, app):
     """Responses API maps function_call + function_call_output items."""
     mock_pipe.return_value = (1, 2)
     mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
@@ -700,6 +809,47 @@ def test_responses_function_call_output(mock_os_read, mock_pipe,
     assert "user" in roles
     assert "assistant" in roles
     assert "tool" in roles
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_responses_replay_raw_tool_call_text(mock_os_read, mock_pipe,
+                                             mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    raw_tool_text = (
+        '<tool_call>'
+        '<function=read_file><parameter=path>file.txt</parameter></function>'
+        '</tool_call>'
+    )
+    mock_tokenizer.decode.side_effect = [raw_tool_text, "followup"]
+    mock_os_read.side_effect = [
+        struct.pack("<i", 10), struct.pack("<i", -1),
+        struct.pack("<i", 11), struct.pack("<i", -1),
+    ]
+
+    client = TestClient(app)
+    first = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": [{"type": "message", "role": "user", "content": "read file.txt"}],
+    })
+    assert first.status_code == 200
+    first_output = first.json()["output"][0]
+
+    second = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": [
+            {"type": "message", "role": "user", "content": "read file.txt"},
+            first_output,
+            {"type": "function_call_output", "call_id": first_output["call_id"], "output": "file body"},
+            {"type": "message", "role": "user", "content": "what next?"},
+        ],
+    })
+    assert second.status_code == 200
+
+    msgs = mock_tokenizer.apply_chat_template.call_args_list[-1][0][0]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["content"] == raw_tool_text
+    assert "tool_calls" not in assistant
 
 
 @patch("server.os.pipe")

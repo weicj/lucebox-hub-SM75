@@ -266,7 +266,12 @@ simultaneously on a 24 GB GPU.
 
 Reproducible comparison vs Ollama native `/api/chat` on the same
 64K unique-prompt summary task, RTX 6000 Ada sm_89,
-Qwen3.6-27B-Q4_K_M, FP16 drafter, FA_WINDOW=0:
+Qwen3.6-27B-Q4_K_M, FA_WINDOW=0. Drafter setup: Qwen3-0.6B BF16
+GGUF for the PFlash compress path (see "Drafter selection" above);
+the larger DFlash drafter on the dflash daemon side ran as FP16
+safetensors during decode-after-unpark on this run. Feel free to
+substitute either drafter side with the format you have on disk —
+the speedup comes from the compress path, not the dtype:
 
 | Backend                                      | TTFT @ 64K |
 |----------------------------------------------|------------|

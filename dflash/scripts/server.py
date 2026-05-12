@@ -41,6 +41,7 @@ from _prefill_hook import (
     compress_text_via_daemon, _drain_until_sentinel,
 )
 from prefix_cache import DaemonStdoutBus, PrefixCache
+from tool_memory import ToolMemory
 
 
 class OpenAICompatError(Exception):
@@ -696,7 +697,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         cap=prefix_cache_slots,
     )
     if prefill_cfg is not None and prefill_cache_slots > 0:
-        prefix_cache.init_full_cache(prefill_cache_slots, budget_bytes=prefill_cache_bytes)
+        prefix_cache.init_full_cache(prefill_cache_slots)
+    tool_memory = ToolMemory(
+        max_entries=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_ENTRIES", "50000")),
+        max_bytes=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_BYTES", str(64 * 1024 * 1024))),
+    )
+
+    def _remember_tool_call_text(raw_text: str, tool_calls: list[dict] | None) -> None:
+        if not raw_text or not tool_calls:
+            return
+        call_ids = [
+            tc.get("id")
+            for tc in tool_calls
+            if isinstance(tc, dict) and isinstance(tc.get("id"), str) and tc.get("id")
+        ]
+        if call_ids:
+            tool_memory.remember(call_ids, raw_text)
 
     @app.on_event("startup")
     async def _startup():
@@ -801,13 +817,18 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         msgs: list[dict] = []
         for m in req.messages:
             d: dict = {"role": m.role}
-            if m.content is not None:
+            replay_raw_text = None
+            if m.role == "assistant" and m.tool_calls is not None:
+                replay_raw_text = tool_memory.lookup_message(m.tool_calls)
+            if replay_raw_text is not None:
+                d["content"] = replay_raw_text
+            elif m.content is not None:
                 d["content"] = _content_to_str(m.content)
             if m.name is not None:
                 d["name"] = m.name
             if m.tool_call_id is not None:
                 d["tool_call_id"] = m.tool_call_id
-            if m.tool_calls is not None:
+            if m.tool_calls is not None and replay_raw_text is None:
                 d["tool_calls"] = []
                 for tc in m.tool_calls:
                     args = tc.function.arguments
@@ -1173,6 +1194,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     mode = "reasoning" if started_in_thinking else "content"
                     window = ""
                     tool_buffer = ""
+                    accumulated_content = ""
+                    accumulated_raw_text = ""
                     stops = normalize_stop(req.stop)
                     tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
                     stop_holdback = max((len(s) for s in stops), default=0)
@@ -1189,6 +1212,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                             completion_tokens += 1
                             piece = tokenizer.decode([tok_id])
+                            accumulated_raw_text += piece
                             window += piece
 
                             if stops and mode != "tool_buffer":
@@ -1197,6 +1221,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     window = window[:si]
                                     stop_hit = True
                                     kind = "reasoning_content" if mode == "reasoning" else "content"
+                                    if mode == "content":
+                                        accumulated_content += window
                                     out = emit_delta(window, kind)
                                     if out: yield out
                                     window = ""
@@ -1236,6 +1262,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         hits.sort()
                                         idx, which = hits[0]
                                         pre = window[:idx]
+                                        accumulated_content += pre
                                         out = emit_delta(pre, "content")
                                         if out: yield out
                                         if which == "think":
@@ -1250,6 +1277,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         continue
                                     if len(window) > HOLDBACK:
                                         safe = window[:-HOLDBACK]
+                                        accumulated_content += safe
                                         out = emit_delta(safe, "content")
                                         if out: yield out
                                         window = window[-HOLDBACK:]
@@ -1277,6 +1305,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             out = emit_delta(window, "reasoning_content")
                             if out: yield out
                         elif mode == "content" and window:
+                            accumulated_content += window
                             out = emit_delta(window, "content")
                             if out: yield out
                         elif mode == "tool_buffer":
@@ -1287,6 +1316,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         if mode == "tool_buffer":
                             cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=req.tools)
                             if tool_calls:
+                                _remember_tool_call_text(accumulated_raw_text, tool_calls)
                                 if cleaned_after:
                                     out = emit_delta(cleaned_after, "content")
                                     if out: yield out
@@ -1412,6 +1442,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if req.chat_template_kwargs:
             thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
         cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
+        _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
             cleaned,
             thinking_enabled=thinking_enabled,
@@ -1909,6 +1940,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if chat_req.chat_template_kwargs:
             thinking_enabled = chat_req.chat_template_kwargs.get("enable_thinking", True)
         cleaned, tool_calls = parse_tool_calls(text, tools=chat_req.tools)
+        _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
             cleaned, thinking_enabled=thinking_enabled,
             started_in_thinking=started_in_thinking)
@@ -2045,6 +2077,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 window = ""
                 tool_buffer = ""
                 accumulated_text = ""
+                accumulated_raw_text = ""
                 tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
                 HOLDBACK = tag_holdback
                 completion_tokens = 0
@@ -2054,6 +2087,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                         completion_tokens += 1
                         piece = tokenizer.decode([tok_id])
+                        accumulated_raw_text += piece
                         window += piece
 
                         while True:
@@ -2141,6 +2175,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 if mode == "tool_buffer" and tool_buffer:
                     cleaned_after, tool_calls = parse_tool_calls(tool_buffer, tools=chat_req.tools)
                     if tool_calls:
+                        _remember_tool_call_text(accumulated_raw_text, tool_calls)
                         if cleaned_after:
                             accumulated_text += cleaned_after
                         for tc in tool_calls:

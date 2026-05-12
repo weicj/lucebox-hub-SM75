@@ -45,8 +45,9 @@ endif()
 # ─── ggml (from the llama.cpp submodule) ─────────────────────────────
 #
 # We use only ggml from the vendored llama.cpp submodule. The drafter is
-# loaded via our own custom Qwen3-0.6B forward (qwen3_0p6b_loader.cpp +
-# qwen3_0p6b_graph.cpp) rather than libllama, so libllama is not built.
+# loaded via our own custom Qwen3-0.6B forward
+# (src/qwen3/qwen3_loader.cpp + src/qwen3/qwen3_graph.cpp)
+# rather than libllama, so libllama is not built.
 #
 # No BLAS, no Metal, no Vulkan, no examples/tests/tools.
 
@@ -185,30 +186,35 @@ endif()
 
 # ─── dflash27b static library ──────────────────────────────────────
 
-set(_dflash27b_sources
+set(DFLASH27B_SRC_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/draft
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+)
+
+add_library(dflash27b STATIC
     src/errors.cpp
-    src/gguf_target_loader.cpp
-    src/gguf_draft_loader.cpp
-    src/safetensors_draft.cpp
-    src/qwen35_target_graph.cpp
-    src/qwen3_dflash_graph.cpp
-    src/qwen3_drafter.cpp
-    src/qwen3_0p6b_loader.cpp
-    src/qwen3_0p6b_graph.cpp
+    src/qwen35/gguf_target_loader.cpp
+    src/qwen35/qwen35_target_graph.cpp
+    src/draft/draft_gguf_loader.cpp
+    src/draft/draft_safetensors_loader.cpp
+    src/draft/draft_dflash_graph.cpp
+    src/qwen3/qwen3_drafter.cpp
+    src/qwen3/qwen3_loader.cpp
+    src/qwen3/qwen3_graph.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
     # Laguna-XS.2 (Poolside) target arch
-    src/laguna_target_loader.cpp
-    src/laguna_target_graph.cpp
-    src/laguna_daemon.cpp
-    src/sampler.cpp
+    src/laguna/laguna_target_loader.cpp
+    src/laguna/laguna_target_graph.cpp
+    src/laguna/laguna_daemon.cpp
+    src/common/sampler.cpp
 )
-# FlashPrefill custom CUDA kernels need CUDA BF16 WMMA (sm_80+). Other CUDA
-# arches and HIP use ggml's flash_attn_ext instead.
-
-add_library(dflash27b STATIC ${_dflash27b_sources})
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
 # run the spec-prefill stack or are building without CUDA BF16 WMMA support
@@ -269,9 +275,9 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         target_compile_definitions(dflash27b PRIVATE
             DFLASH27B_HAVE_FLASHPREFILL=1
             DFLASH27B_CUDA_MIN_SM=80)
-        message(STATUS "dflash: HIP Phase 2 — rocWMMA flashprefill kernels enabled")
+        message(STATUS "dflash: HIP Phase 2 - rocWMMA flashprefill kernels enabled")
     else()
-        message(STATUS "dflash: HIP Phase 1 — ggml q8 fallback for flashprefill")
+        message(STATUS "dflash: HIP Phase 1 - ggml q8 fallback for flashprefill")
     endif()
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80)
     target_sources(dflash27b PRIVATE
@@ -326,7 +332,7 @@ target_include_directories(dflash27b
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${DFLASH27B_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
 )
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
@@ -377,7 +383,7 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     add_executable(pflash_daemon test/pflash_daemon.cpp)
-    target_include_directories(pflash_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(pflash_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
 endif()
 
@@ -393,7 +399,7 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)
-        target_include_directories(test_kv_quant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_kv_quant PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_kv_quant PRIVATE dflash27b)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
@@ -402,77 +408,77 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
-        target_include_directories(smoke_load_draft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_load_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_draft PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_thin_copy.cpp")
         add_executable(spike_thin_copy test/spike_thin_copy.cpp)
-        target_include_directories(spike_thin_copy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(spike_thin_copy PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(spike_thin_copy PRIVATE ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_draft_graph.cpp")
         add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)
-        target_include_directories(smoke_draft_graph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_draft_graph PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_draft_graph PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_0p6b_forward.cpp")
-        add_executable(smoke_qwen3_0p6b_forward test/smoke_qwen3_0p6b_forward.cpp)
-        target_include_directories(smoke_qwen3_0p6b_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(smoke_qwen3_0p6b_forward PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_qwen3_forward.cpp")
+        add_executable(smoke_qwen3_forward test/smoke_qwen3_forward.cpp)
+        target_include_directories(smoke_qwen3_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_qwen3_forward PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/test_vs_oracle.cpp)
-        target_include_directories(test_vs_oracle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_vs_oracle PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_vs_oracle PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target.cpp")
         add_executable(smoke_load_target test/smoke_load_target.cpp)
-        target_include_directories(smoke_load_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_load_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
         add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
-        target_include_directories(smoke_load_target_laguna PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_load_target_laguna PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_target_laguna PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
         add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
-        target_include_directories(smoke_laguna_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_laguna_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_laguna_forward PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_ttft.cpp")
         add_executable(bench_laguna_ttft test/bench_laguna_ttft.cpp)
-        target_include_directories(bench_laguna_ttft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_ttft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_ttft PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_pflash.cpp")
         add_executable(bench_laguna_pflash test/bench_laguna_pflash.cpp)
-        target_include_directories(bench_laguna_pflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_pflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_pflash PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_generate.cpp")
         add_executable(bench_laguna_generate test/bench_laguna_generate.cpp)
-        target_include_directories(bench_laguna_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(bench_laguna_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_generate PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
-        target_include_directories(test_laguna_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_laguna_daemon PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)
-        target_include_directories(smoke_target_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(smoke_target_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_target_forward PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_generate.cpp")
         add_executable(test_generate test/test_generate.cpp)
-        target_include_directories(test_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_generate PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
-        target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_include_directories(test_dflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_dflash PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()

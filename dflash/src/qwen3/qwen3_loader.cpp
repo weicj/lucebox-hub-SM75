@@ -22,7 +22,7 @@
 // We mmap the GGUF file and copy each tensor's bytes to the backend buffer
 // (mirrors the dflash gguf_target_loader pattern).
 
-#include "qwen3_0p6b_drafter.h"
+#include "qwen3_drafter_model.h"
 #include "internal.h"
 
 #include <cstdio>
@@ -75,7 +75,7 @@ float get_f32(gguf_context * g, const char * key, float def) {
 
 } // namespace
 
-bool load_qwen3_0p6b_drafter(const std::string & path,
+bool load_qwen3_drafter_model(const std::string & path,
                               ggml_backend_t backend,
                               Qwen3DrafterWeights & out) {
     out.backend = backend;
@@ -236,7 +236,7 @@ bool load_qwen3_0p6b_drafter(const std::string & path,
     return true;
 }
 
-void free_qwen3_0p6b_drafter(Qwen3DrafterWeights & w) {
+void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();

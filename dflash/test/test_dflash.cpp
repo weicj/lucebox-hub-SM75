@@ -20,7 +20,7 @@
 
 #include "dflash27b.h"
 #include "internal.h"
-#include "dflash_graph.h"
+#include "draft_graph.h"
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
