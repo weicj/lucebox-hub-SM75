@@ -227,6 +227,7 @@ add_library(dflash27b STATIC
     src/qwen35/graph_builders.cpp
     src/qwen35/feature_copy.cpp
     src/qwen35/draft_ipc.cpp
+    src/qwen35/layer_split_forward.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
