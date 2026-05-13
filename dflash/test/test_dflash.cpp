@@ -177,35 +177,11 @@ using dflash27b::extract_draft_topk;
 using dflash27b::build_ddtree;
 using dflash27b::follow_verified_tree;
 
-// ─── StepGraph — rebuilt per call since kv_len varies ──
-
-struct StepGraph {
-    ggml_context *  ctx = nullptr;
-    ggml_cgraph *   gf  = nullptr;
-    ggml_gallocr_t  alloc = nullptr;
-
-    // Named inputs (look up via ggml_get_tensor by name)
-    ggml_tensor *   inp_embed = nullptr;
-    ggml_tensor *   positions = nullptr;
-    ggml_tensor *   attn_mask = nullptr;     // may be null
-    ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
-    ggml_tensor *   target_hidden_cat = nullptr;  // draft only
-    ggml_tensor *   positions_k = nullptr;        // draft only
-    ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-
-    // Output
-    ggml_tensor *   logits = nullptr;
-    ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
-    ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
-    ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
-
-    // Per-delta-net-layer captures (verify only). One entry per delta-net layer.
-    // Each entry's tensors are graph views on the gated_delta_net result:
-    //   ssm_intermediate_states: [S_v, S_v, H_v, n_tokens]  (f32, ~50 MB/layer for n_tokens=16)
-    //   conv_input:              [kernel-1+n_tokens, conv_channels, 1]
-    // Marked as graph outputs so their data is valid after ggml_backend_graph_compute.
-    std::vector<DeltaNetCapture> delta_captures;
-};
+// ─── StepGraph — extracted to src/qwen35/step_graph.h ──
+#include "step_graph.h"
+using dflash27b::StepGraph;
+using dflash27b::step_graph_free;
+using dflash27b::step_graph_destroy;
 
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
@@ -457,35 +433,6 @@ static bool draft_feature_mirror_sync_tail(const TargetCache & cache,
     if (!mirror.target_feat || committed <= 0) return true;
     const int n = std::min(committed, mirror.cap);
     return draft_feature_mirror_sync_range(cache, mirror, committed - n, n);
-}
-
-// Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
-// persistent CUDA buffer in `sg.alloc` alive across steps. When the next
-// build_*_step re-walks ggml_gallocr_alloc_graph on the same (or smaller)
-// peak shape, gallocr reuses the existing CUDA buffer instead of doing a
-// fresh cudaMalloc/cudaFree of multi-GB at every step. That's the single
-// biggest per-step cost at long context — see the [timing] breakdown:
-// draft_compute 21ms and verify_compute 61ms both include the alloc cycle
-// inside ggml_backend_graph_compute when the buffer is fresh.
-static void step_graph_free(StepGraph & sg) {
-    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
-    sg.gf = nullptr;
-    sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
-    sg.target_hidden_cat = sg.positions_k = nullptr;
-    sg.hidden_input = nullptr;
-    sg.parent_ids = nullptr;
-    sg.logits = nullptr;
-    sg.hidden_states = nullptr;
-    sg.argmax_tokens = nullptr;
-    sg.topk_indices = nullptr;
-    sg.delta_captures.clear();
-}
-
-// Called at shutdown only. Releases the persistent gallocr + its CUDA
-// backing buffer in addition to what step_graph_free already does.
-static void step_graph_destroy(StepGraph & sg) {
-    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
-    step_graph_free(sg);
 }
 
 // Build a single-layer forward graph for layer-segmented prefill.
