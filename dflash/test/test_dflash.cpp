@@ -27,6 +27,8 @@
                             // dflash27b::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"  // arch dispatch - single-GPU qwen35 daemon mode
+#include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
+#include "gemma4_daemon.h"  // arch dispatch - gemma4 (iSWA + MoE)
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
                             // sample_logits / parse_sampler_token) used by
                             // both arches; behaviour stays identical.
@@ -1917,13 +1919,15 @@ int main(int argc, char ** argv) {
     };
     const std::string detected_arch = peek_gguf_arch(target_path);
     const bool is_laguna = (detected_arch == "laguna");
+    const bool is_qwen3  = (detected_arch == "qwen3");
+    const bool is_gemma4 = (detected_arch == "gemma4");
 
     // When arch == laguna there is no DFlash draft model (Poolside hasn't
     // released one); server.py omits --draft from the spawn cmd. Accept the
     // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
     // back applies if the user manually drops the draft (argv[2] starts with
     // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
-    const bool no_draft_layout = is_laguna || (argc >= 3 && argv[2][0] == '-');
+    const bool no_draft_layout = is_laguna || is_qwen3 || is_gemma4 || (argc >= 3 && argv[2][0] == '-');
     const char * draft_path  = no_draft_layout ? nullptr : argv[2];
     const int    flags_start = no_draft_layout ? 2 : 3;
     const bool   has_positional_args =
@@ -2179,6 +2183,36 @@ int main(int argc, char ** argv) {
         largs.kv_type     = kv;
         largs.stream_fd   = stream_fd;
         return dflash27b::run_laguna_daemon(largs);
+    }
+
+    // ---- Arch dispatch: qwen3 targets to the dedicated daemon -----
+    if (is_qwen3 && daemon_mode) {
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+        std::fprintf(stderr,
+            "[test_dflash] arch=qwen3 -> dispatching to run_qwen3_daemon "
+            "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
+        dflash27b::Qwen3DaemonArgs q3args;
+        q3args.model_path = target_path;
+        q3args.max_ctx    = max_ctx_eff;
+        q3args.stream_fd  = stream_fd;
+        q3args.chunk      = 512;
+        q3args.gpu        = target_gpu;
+        return dflash27b::run_qwen3_daemon(q3args);
+    }
+
+    // ---- Arch dispatch: gemma4 targets to the dedicated daemon -----
+    if (is_gemma4 && daemon_mode) {
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 8192;
+        std::fprintf(stderr,
+            "[test_dflash] arch=gemma4 -> dispatching to run_gemma4_daemon "
+            "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
+        dflash27b::Gemma4DaemonArgs g4args;
+        g4args.model_path = target_path;
+        g4args.max_ctx    = max_ctx_eff;
+        g4args.stream_fd  = stream_fd;
+        g4args.chunk      = 512;
+        g4args.gpu        = target_gpu;
+        return dflash27b::run_gemma4_daemon(g4args);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).
