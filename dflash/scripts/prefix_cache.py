@@ -86,6 +86,13 @@ class DaemonStdoutBus:
         self._suppress_prefixes = () if verbose else self._DEFAULT_SUPPRESS_PREFIXES
         self._waiters: list[tuple[str, asyncio.Future]] = []
         self._task: asyncio.Task | None = None
+        # Issue #114: side-channel callbacks for daemon-emitted events.
+        # Keys = line prefix, values = zero-arg callable invoked on match.
+        self._line_callbacks: dict[str, callable] = {}
+
+    def register_line_callback(self, prefix: str, cb) -> None:
+        """Invoke ``cb()`` whenever the daemon emits a stdout line starting with ``prefix``."""
+        self._line_callbacks[prefix] = cb
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())
@@ -102,6 +109,15 @@ class DaemonStdoutBus:
                 self._waiters.clear()
                 return
             decoded = line.decode("utf-8", errors="replace").rstrip()
+
+            # Issue #114: side-channel callbacks (e.g. PrefixCache invalidation
+            # on ``[snap] all-cleared``) run before waiter dispatch so cache
+            # state is consistent for any caller awaiting a reply.
+            for _cb_prefix, _cb in self._line_callbacks.items():
+                if decoded.startswith(_cb_prefix):
+                    try: _cb()
+                    except Exception as _cbe:
+                        print(f"  [bus] callback for {_cb_prefix!r} raised: {_cbe}", flush=True)
 
             # Try to satisfy a waiter first.
             matched = False
@@ -524,6 +540,22 @@ class PrefixCache:
             print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
                   f"(of {len(prompt_ids)} total)", flush=True)
         return best
+
+    def mark_all_cleared(self) -> None:
+        """Drop every LRU entry after the daemon emits ``[snap] all-cleared``.
+
+        Issue #114: when the daemon hits an OOM during prefill it frees every
+        prefix snapshot slot to recover VRAM. Without this hook the Python LRU
+        keeps entries pointing at freed slots, and the next request triggers
+        ``RESTORE bad args or empty slot`` and streams nothing back.
+        """
+        if self.disabled:
+            return
+        n = len(self.entries)
+        self.entries.clear()
+        self.next_slot = 0
+        self._pending_evict_key = None
+        print(f"{self.log_prefix} all-cleared — dropped {n} LRU entries", flush=True)
 
     def prepare_inline_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
         """Pick a target boundary + slot for inline snapshot during the next

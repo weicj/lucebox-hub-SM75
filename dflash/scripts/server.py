@@ -698,6 +698,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     )
     if prefill_cfg is not None and prefill_cache_slots > 0:
         prefix_cache.init_full_cache(prefill_cache_slots)
+
+    # Issue #114: invalidate the Python LRU whenever the daemon frees every
+    # prefix snapshot slot during OOM recovery. Without this the next request
+    # would RESTORE a freed slot and stream nothing back.
+    bus.register_line_callback("[snap] all-cleared", prefix_cache.mark_all_cleared)
+
     tool_memory = ToolMemory(
         max_entries=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_ENTRIES", "50000")),
         max_bytes=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_BYTES", str(64 * 1024 * 1024))),

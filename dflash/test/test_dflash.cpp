@@ -4293,7 +4293,13 @@ int main(int argc, char ** argv) {
                                 /*capture_delta_intermediate=*/false,
                                 /*fa_window=*/g_fa_window,
                                 /*last_token_logits_only=*/true)) {
-            std::fprintf(stderr, "prefill gallocr pre-reserve failed\n"); return 1;
+            // Issue #114: gallocr OOM. Free all prefix snapshots so the next
+            // request has VRAM headroom; abort this request cleanly in daemon
+            // mode instead of killing the process.
+            std::fprintf(stderr, "prefill gallocr pre-reserve failed (OOM)\n");
+            for (int _i = 0; _i < PREFIX_CACHE_SLOTS; _i++) free_prefix_snapshot(prefix_snapshots[_i]);
+            std::printf("[snap] all-cleared\n"); std::fflush(stdout);
+            if (daemon_mode) { stream_emit(-1); continue; } else return 1;
         }
         // gallocr is now reserved at peak size; subsequent builds will reuse it.
     }
@@ -4338,11 +4344,17 @@ int main(int argc, char ** argv) {
                                 /*capture_delta_intermediate=*/false,
                                 /*fa_window=*/g_fa_window,
                                 /*last_token_logits_only=*/true)) {
-            std::fprintf(stderr, "prefill build @%d\n", start); return 1;
+            std::fprintf(stderr, "prefill build @%d failed (OOM)\n", start);
+            for (int _i = 0; _i < PREFIX_CACHE_SLOTS; _i++) free_prefix_snapshot(prefix_snapshots[_i]);
+            std::printf("[snap] all-cleared\n"); std::fflush(stdout);
+            if (daemon_mode) { stream_emit(-1); goto _req_aborted_oom; } else return 1;
         }
 
         pf_embed_buf.assign((size_t)hidden * n_tokens, 0.0f);
-        if (!w.embedder.embed(prompt.data() + start, n_tokens, pf_embed_buf.data())) return 1;
+        if (!w.embedder.embed(prompt.data() + start, n_tokens, pf_embed_buf.data())) {
+            std::fprintf(stderr, "prefill embed @%d failed\n", start);
+            if (daemon_mode) { stream_emit(-1); goto _req_aborted_oom; } else return 1;
+        }
         ggml_backend_tensor_set(sg.inp_embed, pf_embed_buf.data(), 0,
                                 sizeof(float) * pf_embed_buf.size());
 
@@ -4374,7 +4386,12 @@ int main(int argc, char ** argv) {
         }
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);
-        if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", start); return 1; }
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill compute @%d failed (OOM)\n", start);
+            for (int _i = 0; _i < PREFIX_CACHE_SLOTS; _i++) free_prefix_snapshot(prefix_snapshots[_i]);
+            std::printf("[snap] all-cleared\n"); std::fflush(stdout);
+            if (daemon_mode) { stream_emit(-1); goto _req_aborted_oom; } else return 1;
+        }
 
         // Logits are [vocab, 1] (last_token_logits_only), read from offset 0.
         pf_logits_buf.assign(vocab, 0.0f);
@@ -4404,6 +4421,12 @@ int main(int argc, char ** argv) {
             // the for-loop does start += PREFILL_UBATCH, so back-adjust.
             start = committed - PREFILL_UBATCH;
         }
+    }
+    // Issue #114: in-loop prefill OOM lands here, then re-enters the daemon
+    // read loop without killing the process. No-op when daemon_mode=false.
+    if (false) {
+    _req_aborted_oom:
+        continue;
     }
     auto t_pf1 = std::chrono::steady_clock::now();
     // If prefill was a no-op due to a snapshot RESTORE (cache.cur_pos already
