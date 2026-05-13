@@ -16,6 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from placement.backend_device import apply_backend_visible_devices, TestDflashLaunchArgs
+
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
@@ -388,37 +390,29 @@ def main():
     print(f"{'prompt':28s}  {'steps':>6s} {'AL':>6s} {'pct%':>6s} {'prefill':>8s} {'decode':>8s}")
     print("-" * 72)
 
-    extra_args = []
-    if args.draft_feature_mirror:
-        extra_args.append("--draft-feature-mirror")
-    if args.peer_access:
-        extra_args.append("--peer-access")
-    if args.target_gpu is not None:
-        extra_args.append(f"--target-gpu={args.target_gpu}")
-    if args.draft_gpu is not None:
-        extra_args.append(f"--draft-gpu={args.draft_gpu}")
-    if args.target_gpus:
-        extra_args.append(f"--target-gpus={args.target_gpus}")
-    if args.target_layer_split:
-        extra_args.append(f"--target-layer-split={args.target_layer_split}")
-    if args.target_split_load_draft:
-        extra_args.append("--target-split-load-draft")
-    if args.target_split_dflash:
-        extra_args.append("--target-split-dflash")
-    if args.draft_ipc_bin:
-        extra_args.append(f"--draft-ipc-bin={args.draft_ipc_bin}")
-    if args.draft_ipc_gpu is not None:
-        extra_args.append(f"--draft-ipc-gpu={args.draft_ipc_gpu}")
-    if args.draft_ipc_work_dir:
-        extra_args.append(f"--draft-ipc-work-dir={args.draft_ipc_work_dir}")
-    if args.draft_ipc_ring_cap is not None:
-        extra_args.append(f"--draft-ipc-ring-cap={args.draft_ipc_ring_cap}")
-    if args.max_ctx is not None:
-        extra_args.append(f"--max-ctx={args.max_ctx}")
+    extra_args = TestDflashLaunchArgs(
+        draft_feature_mirror=args.draft_feature_mirror,
+        peer_access=args.peer_access,
+        target_gpu=args.target_gpu,
+        draft_gpu=args.draft_gpu,
+        target_gpus=args.target_gpus,
+        target_layer_split=args.target_layer_split,
+        target_split_load_draft=args.target_split_load_draft,
+        target_split_dflash=args.target_split_dflash,
+        draft_ipc_bin=args.draft_ipc_bin,
+        draft_ipc_gpu=args.draft_ipc_gpu,
+        draft_ipc_work_dir=args.draft_ipc_work_dir,
+        draft_ipc_ring_cap=args.draft_ipc_ring_cap,
+        max_ctx=args.max_ctx,
+    ).to_cli_args()
 
     extra_env = {}
     if args.cuda_visible_devices:
-        extra_env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+        extra_env = apply_backend_visible_devices(
+            "cuda",
+            visible_devices=args.cuda_visible_devices,
+            base_env=extra_env,
+        )
     if args.prefill_ubatch is not None:
         extra_env["DFLASH27B_PREFILL_UBATCH"] = str(args.prefill_ubatch)
 

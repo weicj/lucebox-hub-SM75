@@ -40,6 +40,7 @@ from _prefill_hook import (
     PrefillConfig, add_cli_flags, config_from_args,
     compress_text_via_daemon, _drain_until_sentinel,
 )
+from placement.backend_device import TestDflashLaunchArgs
 from prefix_cache import DaemonStdoutBus, PrefixCache
 from tool_memory import ToolMemory
 
@@ -2409,23 +2410,26 @@ def main():
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
 
-    extra_daemon: list[str] = []
-    if args.draft_feature_mirror:
-        extra_daemon.append("--draft-feature-mirror")
-    if args.peer_access:
-        extra_daemon.append("--peer-access")
+    extra_daemon_cfg = TestDflashLaunchArgs(
+        draft_feature_mirror=args.draft_feature_mirror,
+        peer_access=args.peer_access,
+    )
     if args.target_gpus:
-        extra_daemon.append(f"--target-gpus={args.target_gpus}")
-        if args.target_layer_split:
-            extra_daemon.append(f"--target-layer-split={args.target_layer_split}")
-        # Keep sharded daemon behavior aligned with the single-GPU server path.
-        extra_daemon.append("--target-split-load-draft")
-        extra_daemon.append("--target-split-dflash")
+        extra_daemon_cfg = TestDflashLaunchArgs(
+            draft_feature_mirror=args.draft_feature_mirror,
+            peer_access=args.peer_access,
+            target_gpus=args.target_gpus,
+            target_layer_split=args.target_layer_split,
+            # Keep sharded daemon behavior aligned with the single-GPU server path.
+            target_split_load_draft=True,
+            target_split_dflash=True,
+        )
         # Multi-GPU daemon mode currently does not implement SNAPSHOT/RESTORE.
         if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
             print("  [cfg] target-gpus daemon mode disables prefix/full cache slots (snapshot protocol unsupported)")
             args.prefix_cache_slots = 0
             args.prefill_cache_slots = 0
+    extra_daemon = extra_daemon_cfg.to_cli_args()
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
