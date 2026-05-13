@@ -23,6 +23,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
+from placement.backend_device import apply_backend_visible_devices, TestDflashLaunchArgs
+
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -124,16 +126,12 @@ class PFlashDaemon:
 
     def start(self) -> float:
         r_fd, w_fd = os.pipe()
-        env = os.environ.copy()
-        env.update(self.env)
-        visible = self.visible_devices or str(self.gpu)
-        if self.backend == "cuda":
-            env["CUDA_VISIBLE_DEVICES"] = visible
-        elif self.backend == "hip":
-            env["HIP_VISIBLE_DEVICES"] = visible
-            env["ROCR_VISIBLE_DEVICES"] = visible
-        else:
-            raise RuntimeError(f"unknown PFlash backend: {self.backend}")
+        env = apply_backend_visible_devices(
+            self.backend,
+            visible_devices=self.visible_devices,
+            fallback_device=self.gpu,
+            base_env={**os.environ, **self.env},
+        )
         cmd = [str(self.binary), str(self.drafter), f"--stream-fd={w_fd}"]
         t0 = time.perf_counter()
         self.proc = subprocess.Popen(
@@ -387,16 +385,11 @@ def parse_env_overrides(values: list[str]) -> dict[str, str]:
 
 
 def target_env(args) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(parse_env_overrides(args.target_env))
-    visible = args.target_visible_devices
-    if visible:
-        if args.target_backend == "cuda":
-            env["CUDA_VISIBLE_DEVICES"] = visible
-        else:
-            env["HIP_VISIBLE_DEVICES"] = visible
-            env["ROCR_VISIBLE_DEVICES"] = visible
-    return env
+    return apply_backend_visible_devices(
+        args.target_backend,
+        visible_devices=args.target_visible_devices,
+        base_env={**os.environ, **parse_env_overrides(args.target_env)},
+    )
 
 
 def run_target_generation(args, case_dir: Path, compressed_text: str,
@@ -416,16 +409,14 @@ def run_target_generation(args, case_dir: Path, compressed_text: str,
         str(prompt_path),
         str(args.target_gen_tokens),
         str(out_path),
-        f"--max-ctx={args.target_max_ctx}",
     ]
-    if args.target_gpus:
-        cmd += ["--target-gpus", args.target_gpus]
-    if args.target_layer_split:
-        cmd += ["--target-layer-split", args.target_layer_split]
-    if args.target_split_load_draft:
-        cmd.append("--target-split-load-draft")
-    if args.target_split_dflash:
-        cmd.append("--target-split-dflash")
+    cmd.extend(TestDflashLaunchArgs(
+        target_gpus=args.target_gpus,
+        target_layer_split=args.target_layer_split,
+        target_split_load_draft=args.target_split_load_draft,
+        target_split_dflash=args.target_split_dflash,
+        max_ctx=args.target_max_ctx,
+    ).to_cli_args())
 
     t0 = time.perf_counter()
     with log_path.open("wb") as log:
