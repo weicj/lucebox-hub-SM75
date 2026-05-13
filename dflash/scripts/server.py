@@ -478,11 +478,18 @@ class ToolDef(BaseModel):
     function: dict  # {name, description, parameters: {...JSON schema...}}
 
 
+# Default cap when the client omits ``max_tokens``. Override at start via
+# the ``DFLASH_DEFAULT_MAX_TOKENS`` env var. Set to a value < ``max_ctx`` to
+# avoid the unbounded-gen path; clients that send their own ``max_tokens``
+# are unaffected.
+DEFAULT_MAX_TOKENS = int(os.environ.get("DFLASH_DEFAULT_MAX_TOKENS", 4096))
+
+
 class ChatRequest(BaseModel):
     model: str = MODEL_NAME
     messages: list[ChatMessage]
     stream: bool = False
-    max_tokens: int = 512
+    max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float | None = None   # 0 = greedy, >0 = sample
     seed: int | None = None             # rng seed for sampling
     top_p: float | None = None         # nucleus, applied when temperature > 0
@@ -1450,7 +1457,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         )
 
         msg: dict = {"role": "assistant"}
-        finish_reason = "stop"
+        # length cap hit when collected token count reached gen_len; otherwise
+        # the daemon stopped naturally (EOS / stop-sequence). The previous code
+        # always emitted "stop", which hid the truncation from clients like
+        # open-webui that retry on finish_reason="length".
+        finish_reason = "length" if len(tokens) >= gen_len else "stop"
         if reasoning:
             msg["reasoning_content"] = reasoning
         if tool_calls:
