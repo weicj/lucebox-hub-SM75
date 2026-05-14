@@ -260,73 +260,9 @@ using dflash27b::free_target_layer_split_shards;
 #include "spec_decode.h"
 using dflash27b::is_eos_tok;
 
-static bool run_target_layer_split_request(
-        std::vector<TargetLayerSplitShard> & shards,
-        DraftWeights * draft_weights,
-        ggml_backend_t draft_backend,
-        int draft_gpu,
-        DraftFeatureMirror * feature_ring,
-        const std::vector<int32_t> & prompt,
-        int n_gen,
-        int max_ctx,
-        bool run_dflash,
-        const char * out_path,
-        int stream_fd) {
-    if (shards.empty() || prompt.empty()) return false;
-    if ((int)prompt.size() + n_gen + 1 > max_ctx) {
-        std::fprintf(stderr, "target-split prompt (%zu) + gen (%d) exceeds max_ctx (%d)\n",
-                     prompt.size(), n_gen, max_ctx);
-        return false;
-    }
-
-    int ubatch = (prompt.size() > 2048) ? 384 : 16;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        ubatch = std::max(1, std::atoi(s));
-    }
-    int last_tok = -1;
-    if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                        prompt, 0, ubatch, last_tok,
-                                        g_kq_stride_pad, g_fa_window,
-                                        feature_ring)) {
-        std::fprintf(stderr, "target-split prefill failed\n");
-        return false;
-    }
-
-    if (run_dflash && draft_weights && feature_ring && feature_ring->target_feat) {
-        const bool ok = run_target_layer_split_dflash_decode(
-            shards, *draft_weights, draft_backend, draft_gpu, *feature_ring,
-            prompt, n_gen, last_tok, out_path,
-            g_kq_stride_pad, g_fa_window, g_draft_ctx_max, stream_fd);
-        // End-of-stream marker for daemon readers.
-        stream_emit_fd(stream_fd, -1);
-        return ok;
-    }
-
-    std::vector<int32_t> out_all = prompt;
-    int generated = 0;
-    for (; generated < n_gen; generated++) {
-        std::vector<int32_t> one(1, last_tok);
-        int next_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                            one, (int)out_all.size(), 1, next_tok,
-                                            g_kq_stride_pad, g_fa_window,
-                                            feature_ring)) {
-            std::fprintf(stderr, "target-split decode failed at %d\n", generated);
-            stream_emit_fd(stream_fd, -1);
-            return false;
-        }
-        out_all.push_back(last_tok);
-        stream_emit_fd(stream_fd, last_tok);
-        if (IS_EOS_TOK(last_tok, shards.front().weights)) {
-            generated++;
-            break;
-        }
-        last_tok = next_tok;
-    }
-    if (out_path) write_int32_file(out_path, out_all);
-    stream_emit_fd(stream_fd, -1);
-    return true;
-}
+// ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
+#include "layer_split_daemon.h"
+using dflash27b::run_target_layer_split_request;
 
 static int run_target_layer_split_daemon(
         const char * target_path,
@@ -478,6 +414,7 @@ static int run_target_layer_split_daemon(
             load_draft ? &feature_ring : nullptr,
             prompt, n_gen, max_ctx, run_dflash,
             /*out_path=*/nullptr,
+            g_kq_stride_pad, g_fa_window, g_draft_ctx_max,
             stream_fd);
         (void)ok;
     }
