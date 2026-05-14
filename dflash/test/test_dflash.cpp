@@ -28,6 +28,7 @@
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"  // arch dispatch - single-GPU qwen35 daemon mode
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
+#include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
 #include "gemma4_daemon.h"  // arch dispatch - gemma4 (iSWA + MoE)
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
@@ -276,154 +277,22 @@ static int run_target_layer_split_daemon(
         int max_verify_tokens,
         bool peer_access,
         int stream_fd) {
-    g_peer_access_opt_in = peer_access;
-    g_peer_pair_ok_cache.clear();
-    const int n_layer = inspect_target_layer_count(target_path);
-    if (n_layer <= 0) {
-        std::fprintf(stderr, "target-split could not read qwen35.block_count\n");
-        return 1;
-    }
-    const auto ranges = compute_layer_ranges(n_layer, (int)target_gpus.size(), split_weights);
-    if ((int)ranges.size() != (int)target_gpus.size()) {
-        std::fprintf(stderr, "bad --target-layer-split for %zu target GPUs and %d layers\n",
-                     target_gpus.size(), n_layer);
-        return 2;
-    }
-    std::vector<TargetLayerSplitShard> shards(target_gpus.size());
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        shards[i].gpu = target_gpus[i];
-        shards[i].layer_begin = ranges[i].first;
-        shards[i].layer_end = ranges[i].second;
-        shards[i].backend = ggml_backend_cuda_init(shards[i].gpu);
-        if (!shards[i].backend) {
-            std::fprintf(stderr, "target-split cuda init failed for gpu %d\n", shards[i].gpu);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        for (size_t j = i + 1; j < target_gpus.size(); j++) {
-            (void)enable_peer_access_pair(target_gpus[i], target_gpus[j]);
-        }
-    }
-    for (auto & shard : shards) {
-        TargetLoadPlan plan;
-        plan.layer_begin = shard.layer_begin;
-        plan.layer_end = shard.layer_end;
-        plan.load_output = (&shard == &shards.back());
-        if (!load_target_gguf_partial(target_path, shard.backend, plan, shard.weights) ||
-            !create_target_cache_partial(shard.weights, max_ctx, max_verify_tokens,
-                                         shard.backend, shard.cache,
-                                         /*prefill_only=*/!run_dflash,
-                                         shard.layer_begin, shard.layer_end,
-                                         /*allocate_target_feat=*/false)) {
-            std::fprintf(stderr, "target-split load/cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-
-    ggml_backend_t draft_backend = nullptr;
-    DraftWeights draft_weights;
-    DraftFeatureMirror feature_ring;
-    bool draft_backend_owned = false;
-    if (load_draft) {
-        for (auto & shard : shards) if (shard.gpu == draft_gpu) draft_backend = shard.backend;
-        if (!draft_backend) {
-            draft_backend = ggml_backend_cuda_init(draft_gpu);
-            if (!draft_backend) {
-                free_target_layer_split_shards(shards);
-                return 1;
-            }
-            draft_backend_owned = true;
-        }
-        std::string dp(draft_path ? draft_path : "");
-        const bool is_gguf = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf");
-        const bool draft_ok = is_gguf
-            ? load_draft_gguf(draft_path, draft_backend, draft_weights)
-            : load_draft_safetensors(draft_path, draft_backend, draft_weights);
-        if (!draft_ok) {
-            std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
-                         draft_gpu, dflash27b_last_error());
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        const int cap = std::min(max_ctx, 4096);
-        if (!draft_feature_mirror_init(feature_ring, draft_backend,
-                                       draft_gpu, draft_gpu, cap)) {
-            std::fprintf(stderr, "target-split feature ring init failed on gpu=%d\n", draft_gpu);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-
-    std::printf("[daemon] ready\n");
-    std::fflush(stdout);
-    for (std::string line; std::getline(std::cin, line); ) {
-        g_sampler = SamplerCfg{};
-        if (parse_sampler_token(line, g_sampler) && g_sampler.seed != 0) {
-            g_sampler_rng.seed(g_sampler.seed);
-        }
-        if (line == "LIST_SLOTS") {
-            std::printf("[snap] slots=\n");
-            std::fflush(stdout);
-            continue;
-        }
-        if (line.rfind("FREE_SNAPSHOT ", 0) == 0) {
-            int slot = -1;
-            std::sscanf(line.c_str() + 14, "%d", &slot);
-            std::printf("[snap] freed slot=%d\n", slot);
-            std::fflush(stdout);
-            continue;
-        }
-        if (line.rfind("SNAPSHOT ", 0) == 0 ||
-            line.rfind("RESTORE ", 0) == 0 ||
-            line.rfind("RESTORE_CHAIN ", 0) == 0 ||
-            line.rfind("SNAPSHOT_THIN ", 0) == 0) {
-            std::fprintf(stderr,
-                         "[target-split] SNAPSHOT/RESTORE are unsupported in sharded daemon mode\n");
-            stream_emit_fd(stream_fd, -1);
-            continue;
-        }
-
-        char ppath[1024] = {0};
-        int n_gen = 0;
-        if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) {
-            stream_emit_fd(stream_fd, -1);
-            continue;
-        }
-        auto prompt = read_int32_file(ppath);
-        if (prompt.empty()) {
-            std::fprintf(stderr, "target-split empty prompt\n");
-            stream_emit_fd(stream_fd, -1);
-            continue;
-        }
-
-        for (auto & shard : shards) {
-            reset_target_cache(shard.cache);
-        }
-        const bool ok = run_target_layer_split_request(
-            shards,
-            load_draft ? &draft_weights : nullptr,
-            draft_backend,
-            draft_gpu,
-            load_draft ? &feature_ring : nullptr,
-            prompt, n_gen, max_ctx, run_dflash,
-            /*out_path=*/nullptr,
-            g_kq_stride_pad, g_fa_window, g_draft_ctx_max,
-            stream_fd);
-        (void)ok;
-    }
-
-    draft_feature_mirror_free(feature_ring);
-    free_draft_weights(draft_weights);
-    if (draft_backend_owned && draft_backend) ggml_backend_free(draft_backend);
-    free_target_layer_split_shards(shards);
-    return 0;
+    LayerSplitDaemonConfig cfg;
+    cfg.target_path = target_path;
+    cfg.draft_path = draft_path;
+    cfg.target_gpus = target_gpus;
+    cfg.split_weights = split_weights;
+    cfg.draft_gpu = draft_gpu;
+    cfg.load_draft = load_draft;
+    cfg.run_dflash = run_dflash;
+    cfg.max_ctx = max_ctx;
+    cfg.max_verify_tokens = max_verify_tokens;
+    cfg.peer_access = peer_access;
+    cfg.stream_fd = stream_fd;
+    cfg.kq_stride_pad = g_kq_stride_pad;
+    cfg.fa_window = g_fa_window;
+    cfg.draft_ctx_max = g_draft_ctx_max;
+    return run_layer_split_daemon(cfg);
 }
 
 static int run_target_layer_split_harness(

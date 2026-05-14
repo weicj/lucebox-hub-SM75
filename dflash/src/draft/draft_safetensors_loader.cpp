@@ -343,7 +343,8 @@ static bool build_prefers_bf16_projection() {
 
 bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t       backend,
-                            DraftWeights &       out) {
+                            DraftWeights &       out,
+                            const TargetWeights * target) {
     // ── 1. Open + mmap ────────────────────────────────────────────
     Mmap mm;
     std::string err;
@@ -377,11 +378,23 @@ bool load_draft_safetensors(const std::string & path,
     if (!out.ctx) { set_last_error("ggml_init failed for draft ctx"); return false; }
     out.backend = backend;
     out.n_layer   = n_layers;
-    out.n_head    = DFLASH27B_TARGET_N_HEADS;
-    out.n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;
-    out.head_dim  = DFLASH27B_TARGET_HEAD_DIM;
-    out.n_embd    = DFLASH27B_TARGET_HIDDEN;  // TODO: read from config.json for non-qwen35
-    out.n_ff      = DFLASH27B_TARGET_INTERMEDIATE;
+
+    // Draft model dims: prefer target model metadata, fall back to compiled defaults.
+    if (target) {
+        out.n_embd    = target->n_embd;
+        out.n_head    = target->n_head;
+        out.n_head_kv = target->n_head_kv;
+        out.head_dim  = target->n_embd_head_k;
+        out.n_ff      = target->n_ff;
+        out.mask_token_id = target->mask_token_id;
+        out.n_target_layers = target->n_capture_layers;
+    } else {
+        out.n_head    = DFLASH27B_TARGET_N_HEADS;
+        out.n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;
+        out.head_dim  = DFLASH27B_TARGET_HEAD_DIM;
+        out.n_embd    = DFLASH27B_TARGET_HIDDEN;
+        out.n_ff      = DFLASH27B_TARGET_INTERMEDIATE;
+    }
     out.layers.assign(n_layers, DraftLayer{});
 
     const int64_t HIDDEN  = out.n_embd;

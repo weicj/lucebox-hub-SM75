@@ -82,16 +82,12 @@ bool Qwen35DFlashTarget::verify_batch(
 }
 
 bool Qwen35DFlashTarget::snapshot_kv() {
-    // Qwen35 uses SSM delta-net state + attention KV.
-    // SSM snapshot is handled by the spec-decode loop via cache intermediates.
-    // This is a stub — full rollback needs the SSM state management from
-    // qwen35_backend's spec-decode path.
+    snapshot_ssm_state(cache_);
     return true;
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
-    // Restore SSM states from snapshot. Stub for now — the actual rollback
-    // logic lives in test_dflash.cpp / qwen35_backend.cpp.
+    restore_ssm_state(cache_);
     return true;
 }
 
@@ -127,7 +123,7 @@ bool Qwen35DFlashTarget::project_hidden_to_tokens(
 }
 
 int Qwen35DFlashTarget::mask_token_id() const {
-    return DFLASH27B_DRAFT_MASK_TOKEN_ID;
+    return w_.mask_token_id;
 }
 
 const std::vector<int> & Qwen35DFlashTarget::capture_layer_ids() const {

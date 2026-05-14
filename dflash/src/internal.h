@@ -159,6 +159,10 @@ struct TargetWeights {
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
 
+    // DFlash noise mask token ID (from target tokenizer, used by draft model).
+    // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
+    int32_t mask_token_id = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
@@ -235,13 +239,17 @@ struct DraftWeights {
 
 bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t backend,
-                            DraftWeights & out);
+                            DraftWeights & out,
+                            const TargetWeights * target = nullptr);
 
 // Load a Q8_0 (or F16) draft model from a GGUF file on disk.
 // Alternative to load_draft_safetensors for quantized drafts.
+// If `target` is non-null, draft dims (n_embd, mask_token_id, etc.) are
+// cross-checked / populated from the target model.
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t backend,
-                     DraftWeights & out);
+                     DraftWeights & out,
+                     const TargetWeights * target = nullptr);
 
 void free_draft_weights(DraftWeights & w);
 

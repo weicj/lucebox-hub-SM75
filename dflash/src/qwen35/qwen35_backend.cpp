@@ -74,8 +74,8 @@ bool Qwen35Backend::init() {
     if (cfg_.draft_path) {
         std::string dp(cfg_.draft_path);
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_);
+            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
+            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
         if (!draft_ok) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return false;
@@ -156,8 +156,8 @@ bool Qwen35Backend::unpark(const std::string & what) {
     if (want_draft && draft_parked_ && cfg_.draft_path) {
         std::string dp(cfg_.draft_path);
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_);
+            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
+            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
         if (!draft_ok) {
             std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
             return false;

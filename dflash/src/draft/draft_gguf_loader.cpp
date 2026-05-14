@@ -118,7 +118,8 @@ int count_swa_layers(const DraftWeights & w) {
 
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t       backend,
-                     DraftWeights &       out) {
+                     DraftWeights &       out,
+                     const TargetWeights * target) {
 
     // ── 1. Parse metadata + create ggml_context with tensor descriptors ──
     ggml_context * meta_ctx = nullptr;
@@ -197,6 +198,11 @@ bool load_draft_gguf(const std::string & path,
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
     out.n_target_layers = (int)n_tgt_lay;
+
+    // Propagate target model properties if available.
+    if (target) {
+        out.mask_token_id = target->mask_token_id;
+    }
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
     // would otherwise trigger huge allocations or signed-int overflow when
