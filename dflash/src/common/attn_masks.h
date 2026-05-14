@@ -61,7 +61,10 @@ inline void build_tree_mask(const DDTree & tree, int past_length,
         }
         for (int j = 0; j < N; j++) {
             if (tree.visibility[(size_t)q * N + j]) {
-                out_mask[(size_t)q * kv_pad + (past_length + j - win_start)] = F16_ZERO;
+                int col = past_length + j - win_start;
+                if (col >= 0 && col < kv_pad) {
+                    out_mask[(size_t)q * kv_pad + col] = F16_ZERO;
+                }
             }
         }
     }
