@@ -40,7 +40,7 @@ DraftGraphOutputs build_draft_graph(
     const DraftWeights &      w,
     const DraftGraphInputs &  in) {
 
-    const int q_len    = DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int q_len    = w.block_size;
     const int ctx_len  = in.ctx_len;
     const int n_head   = w.n_head;
     const int n_kv     = w.n_head_kv;

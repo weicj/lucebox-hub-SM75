@@ -380,7 +380,7 @@ bool load_draft_safetensors(const std::string & path,
     out.n_head    = DFLASH27B_TARGET_N_HEADS;
     out.n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;
     out.head_dim  = DFLASH27B_TARGET_HEAD_DIM;
-    out.n_embd    = DFLASH27B_TARGET_HIDDEN;
+    out.n_embd    = DFLASH27B_TARGET_HIDDEN;  // TODO: read from config.json for non-qwen35
     out.n_ff      = DFLASH27B_TARGET_INTERMEDIATE;
     out.layers.assign(n_layers, DraftLayer{});
 
@@ -389,7 +389,7 @@ bool load_draft_safetensors(const std::string & path,
     const int64_t KV_DIM  = out.n_head_kv * out.head_dim;
     const int64_t INTER   = out.n_ff;
     const int64_t HD      = out.head_dim;
-    const int64_t FC_IN   = DFLASH27B_DRAFT_N_TARGET_LAYERS * HIDDEN;
+    const int64_t FC_IN   = out.n_target_layers * HIDDEN;
 
     // ── 4. Create named tensors in the context ───────────────────
     //

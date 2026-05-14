@@ -34,15 +34,14 @@ bool run_target_layer_split_dflash_decode(
         DFlashDraftIpcClient * remote_draft) {
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (shards.empty() || (!use_remote_draft && !feature_ring.target_feat)) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    (void)hidden;  // used implicitly via DFLASH27B_TARGET_HIDDEN in macros
-    const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int hidden = draft_weights.n_embd;
+    const int q_len = draft_weights.block_size;
     const int output_gpu = shards.back().gpu;
     ggml_backend_t output_backend = shards.back().backend;
 
     StepGraph draft_sg;
     StepGraph proj_sg;
-    std::vector<float> noise_embed((size_t)DFLASH27B_TARGET_HIDDEN * q_len);
+    std::vector<float> noise_embed((size_t)hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len);
     std::vector<int32_t> target_tok(q_len);
@@ -64,7 +63,7 @@ bool run_target_layer_split_dflash_decode(
         const int need_commit_budget = n_gen - n_generated;
 
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+        for (int i = 1; i < q_len; i++) noise_ids[i] = draft_weights.mask_token_id;
         if (!shards.front().weights.embedder.embed(noise_ids.data(), q_len,
                                                     noise_embed.data())) {
             std::fprintf(stderr, "target-split-dflash noise embed failed\n");

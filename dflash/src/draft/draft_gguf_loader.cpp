@@ -194,22 +194,9 @@ bool load_draft_gguf(const std::string & path,
         return false;
     }
 
-    // The draft graph builder still hardcodes block_size and the number of
-    // captured target layers (drives fc weight shape and capture_layer_ids
-    // array length). Reject GGUFs whose metadata disagrees with the compiled
-    // constants, otherwise we would silently mis-shape the graph.
-    if (block_sz != (uint32_t)DFLASH27B_DRAFT_BLOCK_SIZE ||
-        n_tgt_lay != (uint32_t)DFLASH27B_DRAFT_N_TARGET_LAYERS) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-            "draft GGUF: dflash.block_size=%u (expected %d), "
-            "dflash.n_target_layers=%u (expected %d)",
-            block_sz, DFLASH27B_DRAFT_BLOCK_SIZE,
-            n_tgt_lay, DFLASH27B_DRAFT_N_TARGET_LAYERS);
-        set_last_error(buf);
-        gguf_free(gctx);
-        return false;
-    }
+    // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
+    out.block_size = (int)block_sz;
+    out.n_target_layers = (int)n_tgt_lay;
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
     // would otherwise trigger huge allocations or signed-int overflow when

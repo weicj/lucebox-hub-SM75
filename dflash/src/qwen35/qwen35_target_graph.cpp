@@ -184,7 +184,7 @@ bool create_target_cache_partial(const TargetWeights & w,
         constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
         out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
         if (allocate_target_feat) {
-            const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * w.n_embd;  // 25600
+            const int fc_in = w.n_capture_layers * w.n_embd;
             out.target_feat = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_BF16, fc_in, out.target_feat_cap);
             ggml_set_name(out.target_feat, "target_feat");
         } else {
@@ -925,8 +925,8 @@ static ggml_tensor * build_single_layer(
     const TargetLayer & L = w.layers[layer_idx];
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
 
-    static const int CAPTURE_LAYERS[DFLASH27B_DRAFT_N_TARGET_LAYERS] =
-        { 1, 16, 31, 46, 61 };
+    const int * CAPTURE_LAYERS = w.capture_layer_ids;
+    const int N_CAPTURE = w.n_capture_layers;
 
     ggml_tensor * inpSA = inp;
     ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
@@ -962,7 +962,7 @@ static ggml_tensor * build_single_layer(
 
     if (capture && cache.target_feat) {
         int capture_idx = -1;
-        for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
+        for (int k = 0; k < N_CAPTURE; k++) {
             if (CAPTURE_LAYERS[k] == layer_idx) { capture_idx = k; break; }
         }
         if (capture_idx >= 0) {
@@ -1025,10 +1025,9 @@ QwenGraphOutputs build_qwen35_graph(
         og_early.delta_captures.resize(n_delta);
     }
 
-    // DFlash target layer IDs for feature capture: {1, 16, 31, 46, 61}
-    // HF hidden_states[lid+1] convention — capture AFTER layer 'lid' runs.
-    static const int CAPTURE_LAYERS[DFLASH27B_DRAFT_N_TARGET_LAYERS] =
-        { 1, 16, 31, 46, 61 };
+    // DFlash target layer IDs for feature capture (from TargetWeights config).
+    const int * CAPTURE_LAYERS = w.capture_layer_ids;
+    const int N_CAPTURE = w.n_capture_layers;
 
     const int hidden = w.n_embd;
     const float eps  = w.rms_eps;
@@ -1086,7 +1085,7 @@ QwenGraphOutputs build_qwen35_graph(
         // we split the copy into up to two contiguous ggml_cpy ops.
         if (in.capture_layers && cache.target_feat) {
             int capture_idx = -1;
-            for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
+            for (int k = 0; k < N_CAPTURE; k++) {
                 if (CAPTURE_LAYERS[k] == il) { capture_idx = k; break; }
             }
             if (capture_idx >= 0) {

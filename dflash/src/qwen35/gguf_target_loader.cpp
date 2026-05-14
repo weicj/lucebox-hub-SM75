@@ -411,7 +411,7 @@ bool load_target_gguf_partial(const std::string & path,
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
     {
-        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        const int N = out.n_capture_layers;
         const int step = ((int)n_layer - 2) / (N - 1);
         for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
     }

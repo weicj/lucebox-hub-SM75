@@ -110,7 +110,7 @@ bool DFlashDraftIpcClient::send_feature_slice(
     return false;
 #else
     if (!active_ || !cmd_ || n_tokens <= 0) return false;
-    const size_t expected = (size_t)n_tokens * DFLASH27B_TARGET_HIDDEN;
+    const size_t expected = (size_t)n_tokens * hidden_size_;
     if (slice.size() != expected) return false;
     const std::string path = next_path("feature");
     if (!write_binary_file(path, slice.data(), slice.size() * sizeof(float))) {
@@ -141,7 +141,7 @@ bool DFlashDraftIpcClient::propose(
 #else
     if (!active_ || !cmd_ || ctx_len <= 0) return false;
     const size_t noise_expected =
-        (size_t)DFLASH27B_TARGET_HIDDEN * DFLASH27B_DRAFT_BLOCK_SIZE;
+        (size_t)hidden_size_ * block_size_;
     if (noise_embed.size() != noise_expected) return false;
     const std::string path = next_path("noise");
     if (!write_binary_file(path, noise_embed.data(), noise_embed.size() * sizeof(float))) {
@@ -231,7 +231,7 @@ bool copy_capture_slice_to_remote_draft(
         int start_pos,
         int n_tokens) {
     if (!remote.active() || !act_out || capture_idx < 0 || n_tokens <= 0) return true;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = remote.hidden_size();
     const size_t row_bytes = (size_t)hidden * sizeof(float);
     const size_t src_stride = act_out->nb[1];
     std::vector<float> host((size_t)n_tokens * hidden);
@@ -304,8 +304,9 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                  draft_gpu, ring_cap);
     stream_status(stream_fd, 0);
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int hidden = draft_weights.n_embd;
+    const int q_len = draft_weights.block_size;
+    const int n_tgt_layers = draft_weights.n_target_layers;
     StepGraph draft_sg;
     std::vector<float> noise_embed((size_t)hidden * q_len);
     std::vector<int32_t> pos_q(q_len);
@@ -326,7 +327,7 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             int n_tokens = 0;
             iss >> capture_idx >> start_pos >> n_tokens;
             std::string path = read_line_tail(iss);
-            if (capture_idx < 0 || capture_idx >= DFLASH27B_DRAFT_N_TARGET_LAYERS ||
+            if (capture_idx < 0 || capture_idx >= n_tgt_layers ||
                 start_pos < 0 || n_tokens <= 0 || path.empty()) {
                 std::fprintf(stderr, "[draft-ipc-daemon] bad feature_slice: %s\n",
                              line.c_str());

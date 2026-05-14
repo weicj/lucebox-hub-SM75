@@ -18,12 +18,14 @@ namespace dflash27b {
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * target_feat = nullptr; // F32 [5*hidden, cap]
+    ggml_tensor * target_feat = nullptr; // F32 [n_target_layers*hidden_size, cap]
     void * bf16_staging = nullptr;
     size_t bf16_staging_elems = 0;
     int device = 0;
     int target_device = 0;
     int cap = 0;
+    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+    int hidden_size = DFLASH27B_TARGET_HIDDEN;
 };
 
 void draft_feature_mirror_free(DraftFeatureMirror & mirror);
@@ -32,7 +34,9 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
                                ggml_backend_t backend,
                                int device,
                                int target_device,
-                               int cap);
+                               int cap,
+                               int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS,
+                               int hidden_size = DFLASH27B_TARGET_HIDDEN);
 
 // Check whether the mirror ring buffer can provide a contiguous view
 // of ctx_len slots ending at committed. Returns slot0 (the starting

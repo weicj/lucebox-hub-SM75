@@ -92,8 +92,8 @@ bool Qwen35Backend::init() {
 
     // Create KV cache
     const int max_verify_tokens = cfg_.ddtree_mode
-        ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, cfg_.ddtree_budget + 1)
-        : DFLASH27B_DRAFT_BLOCK_SIZE;
+        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+        : dw_.block_size;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -394,15 +394,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                int snap_pos, int snap_slot) {
     (void)io; (void)snap_pos; (void)snap_slot;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w_.n_embd;
     const int PREFILL_UBATCH = 512;
     const int prompt_len = (int)tokens.size();
 
     // Migrate to full-mode KV cache if needed
     migrate_prefill_cache(w_, cfg_.device.max_ctx,
                           cfg_.ddtree_mode
-                              ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, cfg_.ddtree_budget + 1)
-                              : DFLASH27B_DRAFT_BLOCK_SIZE,
+                              ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+                              : dw_.block_size,
                           target_backend_, cache_);
 
     // Chunked prefill
@@ -496,10 +496,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     //
     // For now, fall back to simple autoregressive decode (no draft).
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab  = DFLASH27B_TARGET_VOCAB;
+    const int hidden = w_.n_embd;
+    const int vocab  = w_.n_vocab;
     std::vector<float> logits_buf(vocab);
-    float embed_buf[DFLASH27B_TARGET_HIDDEN];
+    std::vector<float> embed_buf_vec(hidden);
+    float * embed_buf = embed_buf_vec.data();
 
     for (int i = 0; i < n_gen; i++) {
         if (!build_target_step(sg_, w_, cache_, target_backend_,

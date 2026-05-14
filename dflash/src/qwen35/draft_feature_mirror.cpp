@@ -64,11 +64,15 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
                                ggml_backend_t backend,
                                int device,
                                int target_device,
-                               int cap) {
+                               int cap,
+                               int n_target_layers,
+                               int hidden_size) {
     draft_feature_mirror_free(mirror);
     if (cap <= 0) return false;
     mirror.device = device;
     mirror.target_device = target_device;
+    mirror.n_target_layers = n_target_layers;
+    mirror.hidden_size = hidden_size;
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 4 + 16 * 1024;
@@ -77,7 +81,7 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
     mirror.ctx = ggml_init(ip);
     if (!mirror.ctx) return false;
 
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
+    const int fc_in = n_target_layers * hidden_size;
     mirror.target_feat = ggml_new_tensor_2d(mirror.ctx, GGML_TYPE_F32, fc_in, cap);
     ggml_set_name(mirror.target_feat, "draft_target_feat_mirror");
     mirror.buf = ggml_backend_alloc_ctx_tensors(mirror.ctx, backend);
@@ -115,7 +119,7 @@ bool draft_feature_mirror_sync_range(const TargetCache & cache,
     if (n_tokens <= 0) return true;
     if (n_tokens > mirror.cap) return false;
 
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
+    const int fc_in = mirror.n_target_layers * mirror.hidden_size;
     const int src_cap = cache.target_feat_cap;
     const size_t src_stride = cache.target_feat->nb[1];
     const size_t dst_stride = mirror.target_feat->nb[1];

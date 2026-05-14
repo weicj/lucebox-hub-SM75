@@ -74,8 +74,8 @@ bool run_target_layer_split_forward(
         std::vector<float> * logits_out,
         DFlashDraftIpcClient * remote_draft) {
     if (shards.empty() || tokens.empty()) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab = DFLASH27B_TARGET_VOCAB;
+    const int hidden = shards.front().weights.n_embd;
+    const int vocab = shards.front().weights.n_vocab;
     const int n_tokens_total = (int)tokens.size();
     ubatch = std::max(1, ubatch);
 

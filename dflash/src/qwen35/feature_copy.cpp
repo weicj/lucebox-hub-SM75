@@ -12,7 +12,7 @@
 namespace dflash27b {
 
 int target_capture_index(const TargetWeights & w, int layer_idx) {
-    for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
+    for (int k = 0; k < w.n_capture_layers; k++) {
         if (w.capture_layer_ids[k] == layer_idx) return k;
     }
     return -1;
@@ -28,7 +28,7 @@ bool copy_capture_slice_to_draft_ring(
     int n_tokens) {
     if (!feature_ring.target_feat || capture_idx < 0 || n_tokens <= 0) return true;
     if (feature_ring.cap <= 0) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = feature_ring.hidden_size;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
     const size_t src_stride = act_out->nb[1];
     const size_t row_bytes = (size_t)hidden * sizeof(float);
@@ -54,7 +54,7 @@ bool copy_feature_ring_range_to_tensor(
     if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
     if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
 
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
+    const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
     const size_t row_bytes = (size_t)fc_in * sizeof(float);
     const size_t src_stride = feature_ring.target_feat->nb[1];
     const size_t dst_stride = dst->nb[1];

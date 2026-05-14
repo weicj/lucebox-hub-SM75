@@ -33,6 +33,10 @@ namespace dflash27b {
 class DFlashDraftIpcClient {
 public:
     DFlashDraftIpcClient() = default;
+    // Construct with target dimensions (used for size validation in IPC).
+    DFlashDraftIpcClient(int hidden_size, int block_size, int n_target_layers)
+        : hidden_size_(hidden_size), block_size_(block_size),
+          n_target_layers_(n_target_layers) {}
     DFlashDraftIpcClient(const DFlashDraftIpcClient &) = delete;
     DFlashDraftIpcClient & operator=(const DFlashDraftIpcClient &) = delete;
     ~DFlashDraftIpcClient() { close(); }
@@ -55,6 +59,9 @@ public:
 
     bool active() const { return active_; }
     int ring_cap() const { return ring_cap_; }
+    int hidden_size() const { return hidden_size_; }
+    int block_size() const { return block_size_; }
+    int n_target_layers() const { return n_target_layers_; }
     void close();
 
 private:
@@ -71,6 +78,9 @@ private:
 #endif
     bool active_ = false;
     int ring_cap_ = 0;
+    int hidden_size_ = DFLASH27B_TARGET_HIDDEN;
+    int block_size_ = DFLASH27B_DRAFT_BLOCK_SIZE;
+    int n_target_layers_ = DFLASH27B_DRAFT_N_TARGET_LAYERS;
 };
 
 // ── Remote draft feature copy helper ────────────────────────────────

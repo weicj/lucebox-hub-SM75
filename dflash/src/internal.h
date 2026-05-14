@@ -162,6 +162,7 @@ struct TargetWeights {
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
+    int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
     int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
@@ -225,6 +226,11 @@ struct DraftWeights {
     int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
+
+    // DFlash draft-specific config (populated by loader or set by caller).
+    int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
+    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
 };
 
 bool load_draft_safetensors(const std::string & path,

@@ -35,7 +35,7 @@ bool build_layer_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
 
     sg.inp_embed = ggml_view_2d(sg.ctx, act_in,
         hidden, n_tokens,
@@ -103,7 +103,7 @@ bool build_target_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -172,7 +172,7 @@ bool build_target_step_tree(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -241,9 +241,9 @@ bool build_draft_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
+    const int hidden = dw.n_embd;
+    const int q_len  = dw.block_size;
+    const int fc_in  = dw.n_target_layers * hidden;
 
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, q_len, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
@@ -321,7 +321,7 @@ bool build_lm_head_projection_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.hidden_input = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.hidden_input, "draft_hidden_for_lm_head");
     ggml_set_input(sg.hidden_input);
