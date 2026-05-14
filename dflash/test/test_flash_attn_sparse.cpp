@@ -104,14 +104,15 @@ static bool test_sparse_matches_dense(ggml_backend_t backend, int S, int H, int 
         if (diff > max_diff) max_diff = diff;
     }
 
+    const bool pass = max_diff < 1e-3f && !any_nonfinite;
     printf("[test] S=%d H=%d Hk=%d D=%d max_diff=%.6f nonfinite=%s %s\n",
            S, H, Hk, D, max_diff,
            any_nonfinite ? "YES" : "no",
-           (max_diff < 1.0f && !any_nonfinite) ? "PASS" : "FAIL");
+           pass ? "PASS" : "FAIL");
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    return max_diff < 1e-3f && !any_nonfinite;
+    return pass;
 }
 
 // Sanity-check sparse attention at alpha < 1.0:
