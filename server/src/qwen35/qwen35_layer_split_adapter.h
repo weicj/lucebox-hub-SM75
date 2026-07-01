@@ -43,15 +43,15 @@ struct Qwen35LayerSplitAdapterConfig {
     int draft_swa_window = 0;
 };
 
-class Qwen35LayerSplitAdapter : public LayerSplitAdapter {
+class Qwen35FamilyLayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapterConfig & cfg);
-    ~Qwen35LayerSplitAdapter() override;
+    explicit Qwen35FamilyLayerSplitAdapter(const Qwen35LayerSplitAdapterConfig & cfg);
+    ~Qwen35FamilyLayerSplitAdapter() override;
 
-    Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapter &) = delete;
-    Qwen35LayerSplitAdapter & operator=(const Qwen35LayerSplitAdapter &) = delete;
+    Qwen35FamilyLayerSplitAdapter(const Qwen35FamilyLayerSplitAdapter &) = delete;
+    Qwen35FamilyLayerSplitAdapter & operator=(const Qwen35FamilyLayerSplitAdapter &) = delete;
 
-    const char * name() const override { return "qwen35"; }
+    const char * name() const override = 0;
     bool init() override;
     int max_context() const override { return cfg_.device.max_ctx; }
 
@@ -95,6 +95,11 @@ public:
     }
 
     void shutdown() override;
+
+protected:
+    const Qwen35LayerSplitAdapterConfig & config() const { return cfg_; }
+    virtual int default_prefill_ubatch(int prompt_tokens) const;
+    virtual const char * prefill_ubatch_env() const;
 
 private:
     bool load_draft();
@@ -161,6 +166,14 @@ private:
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::unique_ptr<DFlashTarget> dflash_target_;
     std::vector<float> prefill_last_logits_;
+};
+
+class Qwen35LayerSplitAdapter final : public Qwen35FamilyLayerSplitAdapter {
+public:
+    explicit Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapterConfig & cfg)
+        : Qwen35FamilyLayerSplitAdapter(cfg) {}
+
+    const char * name() const override { return "qwen35"; }
 };
 
 }  // namespace dflash::common

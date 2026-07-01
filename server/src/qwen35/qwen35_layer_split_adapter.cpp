@@ -27,13 +27,13 @@
 
 namespace dflash::common {
 
-Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
+Qwen35FamilyLayerSplitAdapter::Qwen35FamilyLayerSplitAdapter(
         const Qwen35LayerSplitAdapterConfig & cfg)
     : cfg_(cfg) {}
 
-Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
+Qwen35FamilyLayerSplitAdapter::~Qwen35FamilyLayerSplitAdapter() { shutdown(); }
 
-bool Qwen35LayerSplitAdapter::init() {
+bool Qwen35FamilyLayerSplitAdapter::init() {
     if (cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled()) {
         return init_mixed_target_split();
     }
@@ -120,7 +120,7 @@ bool Qwen35LayerSplitAdapter::init() {
     return true;
 }
 
-void Qwen35LayerSplitAdapter::kvflash_read_config() {
+void Qwen35FamilyLayerSplitAdapter::kvflash_read_config() {
     if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
     const bool target_shard_split =
         cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
@@ -168,7 +168,7 @@ void Qwen35LayerSplitAdapter::kvflash_read_config() {
     }
 }
 
-bool Qwen35LayerSplitAdapter::kvflash_attach() {
+bool Qwen35FamilyLayerSplitAdapter::kvflash_attach() {
     if (!kvflash_active()) return true;
     std::vector<ggml_tensor *> full_k;
     std::vector<ggml_tensor *> full_v;
@@ -208,7 +208,7 @@ bool Qwen35LayerSplitAdapter::kvflash_attach() {
     return true;
 }
 
-bool Qwen35LayerSplitAdapter::kvflash_sync_identity(int committed) {
+bool Qwen35FamilyLayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
     if (!layer_split_kvflash_sync_identity(
             kvflash_pager_, committed, kvflash_tokens_, "target-split")) {
@@ -224,13 +224,13 @@ bool Qwen35LayerSplitAdapter::kvflash_sync_identity(int committed) {
     return true;
 }
 
-void Qwen35LayerSplitAdapter::kvflash_sync_history(
+void Qwen35FamilyLayerSplitAdapter::kvflash_sync_history(
         const std::vector<int32_t> & tokens, int base_pos) {
     if (!kvflash_active()) return;
     layer_split_kvflash_sync_history(kvflash_history_, tokens, base_pos);
 }
 
-void Qwen35LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
+void Qwen35FamilyLayerSplitAdapter::kvflash_maybe_reselect(int generated) {
     if (!kvflash_active() || kvflash_tau_ <= 0) return;
     if (use_mixed_target_split()) return;
     const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
@@ -274,7 +274,7 @@ void Qwen35LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
     }
 }
 
-bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
+bool Qwen35FamilyLayerSplitAdapter::init_mixed_target_split() {
     if (!cfg_.remote_target_shard.enabled() ||
         cfg_.device.layer_split_gpus.size() < 2) {
         std::fprintf(stderr,
@@ -420,7 +420,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
     return true;
 }
 
-bool Qwen35LayerSplitAdapter::load_draft() {
+bool Qwen35FamilyLayerSplitAdapter::load_draft() {
     if (cfg_.remote_draft.enabled()) {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
@@ -491,14 +491,14 @@ bool Qwen35LayerSplitAdapter::load_draft() {
     return true;
 }
 
-void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
+void Qwen35FamilyLayerSplitAdapter::begin_request(const GenerateRequest & req) {
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
 }
 
-void Qwen35LayerSplitAdapter::reset_request_state() {
+void Qwen35FamilyLayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
     if (kvflash_active()) {
         kvflash_pager_.reset();
@@ -514,14 +514,22 @@ void Qwen35LayerSplitAdapter::reset_request_state() {
     prefill_last_logits_.clear();
 }
 
-int Qwen35LayerSplitAdapter::prefill_chunk_tokens() const {
+int Qwen35FamilyLayerSplitAdapter::prefill_chunk_tokens() const {
     if (kvflash_active()) {
         return kvflash_pager_.chunk_tokens();
     }
     return cfg_.chunk > 0 ? cfg_.chunk : 0;
 }
 
-bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
+int Qwen35FamilyLayerSplitAdapter::default_prefill_ubatch(int prompt_tokens) const {
+    return prompt_tokens > 2048 ? 384 : 16;
+}
+
+const char * Qwen35FamilyLayerSplitAdapter::prefill_ubatch_env() const {
+    return "DFLASH27B_PREFILL_UBATCH";
+}
+
+bool Qwen35FamilyLayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos, int & last_tok) {
     if (prompt.empty()) return false;
     if (base_pos < 0 || base_pos + (int)prompt.size() > cfg_.device.max_ctx) {
@@ -530,8 +538,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             base_pos, (size_t)base_pos + prompt.size(), cfg_.device.max_ctx);
         return false;
     }
-    int ubatch = prompt.size() > 2048 ? 384 : 16;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+    int ubatch = default_prefill_ubatch((int)prompt.size());
+    if (const char * s = std::getenv(prefill_ubatch_env())) {
         ubatch = std::max(1, std::atoi(s));
     }
     if (use_mixed_target_split()) {
@@ -566,13 +574,13 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
     return ok;
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_slot_valid(int slot) const {
+bool Qwen35FamilyLayerSplitAdapter::snapshot_slot_valid(int slot) const {
     return slot >= 0 && slot < PREFIX_SLOTS &&
            prefix_snapshots_.size() == (size_t)PREFIX_SLOTS &&
            !shards_.empty();
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
+bool Qwen35FamilyLayerSplitAdapter::snapshot_save(int slot) {
     if (!snapshot_slot_valid(slot)) return false;
     if (snapshot_backends_.size() != shards_.size()) return false;
     const int cur_pos = shards_.empty() ? 0 : shards_.front().cache.cur_pos;
@@ -621,7 +629,7 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
     return true;
 }
 
-void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
+void Qwen35FamilyLayerSplitAdapter::snapshot_free(int slot) {
     if (!snapshot_slot_valid(slot)) return;
     ggml_context * disk_ctx = nullptr;
     ggml_backend_buffer_t disk_buf = nullptr;
@@ -663,7 +671,7 @@ void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     free_draft_feature_snapshot(slot);
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
+bool Qwen35FamilyLayerSplitAdapter::snapshot_used(int slot) const {
     if (!snapshot_slot_valid(slot)) return false;
     const auto & snaps = prefix_snapshots_[(size_t)slot];
     if (snaps.size() != shards_.size()) return false;
@@ -683,12 +691,12 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     return true;
 }
 
-int Qwen35LayerSplitAdapter::snapshot_cur_pos(int slot) const {
+int Qwen35FamilyLayerSplitAdapter::snapshot_cur_pos(int slot) const {
     if (!snapshot_used(slot)) return 0;
     return prefix_snapshots_[(size_t)slot].front().cur_pos;
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
+bool Qwen35FamilyLayerSplitAdapter::snapshot_restore(int slot) {
     if (!snapshot_used(slot)) return false;
     auto & snaps = prefix_snapshots_[(size_t)slot];
     const int cur_pos = snaps.front().cur_pos;
@@ -713,7 +721,7 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
     return true;
 }
 
-bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
+bool Qwen35FamilyLayerSplitAdapter::rebuild_disk_snapshot(int slot) {
     if (!snapshot_slot_valid(slot)) return false;
     if (disk_snapshot_contexts_.size() != (size_t)PREFIX_SLOTS ||
         disk_snapshot_buffers_.size() != (size_t)PREFIX_SLOTS ||
@@ -911,7 +919,7 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
     return true;
 }
 
-ModelBackend::SnapshotRef Qwen35LayerSplitAdapter::snapshot_ref(int slot) const {
+ModelBackend::SnapshotRef Qwen35FamilyLayerSplitAdapter::snapshot_ref(int slot) const {
     ModelBackend::SnapshotRef ref;
     if (!snapshot_used(slot)) return ref;
     if (slot < 0 || slot >= (int)disk_snapshot_contexts_.size()) return ref;
@@ -928,7 +936,7 @@ ModelBackend::SnapshotRef Qwen35LayerSplitAdapter::snapshot_ref(int slot) const 
     return ref;
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
+bool Qwen35FamilyLayerSplitAdapter::snapshot_adopt(int slot,
                                              ggml_context * ctx,
                                              ggml_backend_buffer_t buf,
                                              int cur_pos,
@@ -1180,7 +1188,7 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     return true;
 }
 
-bool Qwen35LayerSplitAdapter::snapshot_draft_features(int slot) {
+bool Qwen35FamilyLayerSplitAdapter::snapshot_draft_features(int slot) {
     if (!cfg_.run_dflash || !cfg_.draft_path) {
         free_draft_feature_snapshot(slot);
         return true;
@@ -1222,7 +1230,7 @@ bool Qwen35LayerSplitAdapter::snapshot_draft_features(int slot) {
         feature_ring_, start_pos, n_tokens, snap.data);
 }
 
-void Qwen35LayerSplitAdapter::free_draft_feature_snapshot(int slot) {
+void Qwen35FamilyLayerSplitAdapter::free_draft_feature_snapshot(int slot) {
     if (slot < 0 || draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS ||
         slot >= (int)draft_feature_snapshots_.size()) {
         return;
@@ -1230,7 +1238,7 @@ void Qwen35LayerSplitAdapter::free_draft_feature_snapshot(int slot) {
     draft_feature_snapshots_[(size_t)slot] = DraftFeatureSnapshot{};
 }
 
-bool Qwen35LayerSplitAdapter::restore_draft_features(int slot) {
+bool Qwen35FamilyLayerSplitAdapter::restore_draft_features(int slot) {
     if (!cfg_.run_dflash || !cfg_.draft_path) return true;
     if (slot < 0 || draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS ||
         slot >= (int)draft_feature_snapshots_.size()) {
@@ -1263,12 +1271,12 @@ bool Qwen35LayerSplitAdapter::restore_draft_features(int slot) {
         feature_ring_, snap.start_pos, snap.n_tokens, snap.data);
 }
 
-int Qwen35LayerSplitAdapter::current_last_token() const {
+int Qwen35FamilyLayerSplitAdapter::current_last_token() const {
     if (shards_.empty()) return -1;
     return shards_.front().cache.last_tok;
 }
 
-bool Qwen35LayerSplitAdapter::decode_ar(
+bool Qwen35FamilyLayerSplitAdapter::decode_ar(
         int last_tok, int committed, int n_gen,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
@@ -1310,11 +1318,11 @@ bool Qwen35LayerSplitAdapter::decode_ar(
     return ok;
 }
 
-bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
+bool Qwen35FamilyLayerSplitAdapter::can_dflash_decode() const {
     return cfg_.run_dflash && cfg_.draft_path && !sampler_.needs_logit_processing();
 }
 
-bool Qwen35LayerSplitAdapter::decode_dflash(
+bool Qwen35FamilyLayerSplitAdapter::decode_dflash(
         const std::vector<int32_t> & prompt, int base_pos, int last_tok, int n_gen,
         std::vector<int32_t> & out_tokens, const DaemonIO & io,
         float & accept_rate_out) {
@@ -1344,12 +1352,12 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
     return ok;
 }
 
-const char * Qwen35LayerSplitAdapter::default_compress_drafter_path() const {
+const char * Qwen35FamilyLayerSplitAdapter::default_compress_drafter_path() const {
     return "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
 }
 
 ModelBackend::CompressResult
-Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
+Qwen35FamilyLayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
     ModelBackend::CompressResult result;
     if (req.input_ids.empty() || req.drafter_path.empty()) return result;
 
@@ -1380,7 +1388,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
     return result;
 }
 
-void Qwen35LayerSplitAdapter::free_drafter() {
+void Qwen35FamilyLayerSplitAdapter::free_drafter() {
     remote_draft_.close();
     if (pflash_drafter_loaded_) {
         dflash::common::free_drafter(pflash_drafter_);
@@ -1395,7 +1403,7 @@ void Qwen35LayerSplitAdapter::free_drafter() {
     step_graph_destroy(proj_sg_);
 }
 
-DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
+DFlashTarget * Qwen35FamilyLayerSplitAdapter::dflash_target() {
     if (!dflash_target_) {
         dflash_target_ = std::make_unique<Qwen35LayerSplitDFlashTarget>(
             shards_,
@@ -1408,7 +1416,7 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
     return dflash_target_.get();
 }
 
-void Qwen35LayerSplitAdapter::shutdown() {
+void Qwen35FamilyLayerSplitAdapter::shutdown() {
     dflash_target_.reset();
     free_drafter();
     for (int slot = 0; slot < (int)prefix_snapshots_.size(); ++slot) {
